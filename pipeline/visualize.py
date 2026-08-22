@@ -170,8 +170,9 @@ def render_annotated_video(
             # goes where the traffic is. Non-destructive: pixels are dimmed, never
             # blanked, so a judge can still see what was excluded and why.
             if off_road is not None:
-                img[off_road] = (img[off_road] * 0.38).astype(np.uint8)
-                cv2.drawContours(img, road_contour, -1, (70, 200, 110), 1, cv2.LINE_AA)
+                img[off_road] = (img[off_road] * 0.42).astype(np.uint8)
+                cv2.drawContours(img, road_contour, -1, (20, 40, 20), 3, cv2.LINE_AA)
+                cv2.drawContours(img, road_contour, -1, (80, 230, 120), 1, cv2.LINE_AA)
 
             active_flags: dict[int, tuple[str, str]] = {}
             conflict_pairs: list[tuple[int, int, str]] = []

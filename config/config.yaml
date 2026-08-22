@@ -108,7 +108,7 @@ segmentation:
   sam_max_seeds: 24             # trajectory points used to prompt SAM
   # The empirical estimate: rasterised trajectory points dilated by ~a lane width.
   # 26 px at 0.0617 m/px is about 1.6 m, roughly half a lane.
-  lane_width_px: 26
+  lane_width_px: 45
   # Off-road detections are DIMMED in the video by default but NOT deleted from
   # the analytics, because an off-road detection may be a real road user on a
   # footpath or verge. Turn this on to actually drop them.
