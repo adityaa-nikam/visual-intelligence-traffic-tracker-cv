@@ -43,34 +43,68 @@ def _largest_components(mask: np.ndarray, min_area_frac: float = 0.005) -> np.nd
     return keep
 
 
+def fill_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill all internal holes in a binary mask."""
+    if mask is None or not np.any(mask):
+        return mask
+    contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(mask, dtype=np.uint8)
+    if contours:
+        cv2.drawContours(filled, contours, -1, 255, -1)
+    return filled
+
+
+def smooth_mask(mask: np.ndarray, close_k: int = 31, blur_k: int = 15) -> np.ndarray:
+    """Smooth jagged mask boundaries using morphological closing, hole-filling, and Gaussian filtering."""
+    if mask is None or not np.any(mask):
+        return mask
+    m = fill_holes(mask)
+    if close_k > 0:
+        k_size = max(3, int(close_k) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+        m = fill_holes(m)
+    if blur_k > 0:
+        b_size = max(3, int(blur_k) | 1)
+        blurred = cv2.GaussianBlur(m, (b_size, b_size), 0)
+        _, m = cv2.threshold(blurred, 120, 255, cv2.THRESH_BINARY)
+        m = fill_holes(m)
+    return _largest_components(m)
+
+
 def travelled_mask(
     obs: pd.DataFrame,
     shape: tuple[int, int],
-    lane_width_px: int = 26,
+    lane_width_px: int = 40,
 ) -> np.ndarray:
     """
     Empirical drivable area: where road users were actually observed.
 
-    Uses the bbox bottom-centre (the road-contact point), dilated by roughly a
-    lane half-width, then closed to bridge gaps between lanes.
+    Connects consecutive observations into continuous trajectory corridors,
+    dilates by a realistic lane width, fills internal holes, and smooths boundaries.
     """
     h, w = shape
     canvas = np.zeros((h, w), np.uint8)
-    pts = obs.dropna(subset=["x", "y"])[["x", "y"]].to_numpy()
-    if len(pts) == 0:
+    if obs is None or obs.empty:
         return canvas
 
-    xi = np.clip(pts[:, 0].astype(np.int32), 0, w - 1)
-    yi = np.clip(pts[:, 1].astype(np.int32), 0, h - 1)
-    canvas[yi, xi] = 255
+    xcol = "x_seg" if ("x_seg" in obs.columns and obs["x_seg"].notna().any()) else "x"
+    ycol = "y_seg" if ("y_seg" in obs.columns and obs["y_seg"].notna().any()) else "y"
 
-    k = max(3, int(lane_width_px) | 1)
-    canvas = cv2.dilate(canvas, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    # Close across lane gaps, then fill enclosed holes (traffic islands excepted).
-    big = max(3, int(lane_width_px * 2) | 1)
-    canvas = cv2.morphologyEx(canvas, cv2.MORPH_CLOSE,
-                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (big, big)))
-    return _largest_components(canvas)
+    pts_df = obs.dropna(subset=[xcol, ycol])
+    if pts_df.empty:
+        return canvas
+
+    lane_r = max(20, int(lane_width_px))
+    for tid, group in pts_df.groupby("track_id"):
+        g_pts = group.sort_values("frame")[[xcol, ycol]].to_numpy(np.int32)
+        if len(g_pts) > 1:
+            cv2.polylines(canvas, [g_pts], False, 255, thickness=lane_r * 2, lineType=cv2.LINE_AA)
+        for pt in g_pts:
+            cv2.circle(canvas, (int(pt[0]), int(pt[1])), lane_r, 255, -1, lineType=cv2.LINE_AA)
+
+    close_k = max(35, int(lane_r * 2.5) | 1)
+    return smooth_mask(canvas, close_k=close_k, blur_k=21)
 
 
 def _seed_points(
@@ -333,7 +367,7 @@ def build_road_mask(
     # Union, not intersection: we want road SAM found that was simply unused this
     # minute (empty lanes, far arms) included, while the travelled mask guarantees
     # we never lose road we have direct evidence for.
-    combined = _largest_components(cv2.bitwise_or(trav, sam))
+    combined = smooth_mask(cv2.bitwise_or(trav, sam), close_k=25, blur_k=15)
     info["source"] = "sam_union_travelled"
     info["road_area_frac"] = round(float((combined > 0).mean()), 4)
     return combined, info

@@ -216,49 +216,51 @@ if cong_levels:
 
 st.divider()
 
-# ------------------------------------------------------- video + traffic summary
-left, right = st.columns([1.65, 1], gap="large")
-
-with left:
-    st.subheader("Annotated aerial view")
-    versions = video_versions(tag)
-    vid = versions[-1] if versions else suffixed("annotated", ".mp4", tag)
-    if len(versions) > 1:
-        vid = st.selectbox(
-            "render", list(reversed(versions)), index=0,
-            format_func=lambda p: os.path.basename(p) + (
-                "  (latest)" if p == versions[-1] else ""),
-            help="Renders are never overwritten, so earlier versions stay on disk "
-                 "for side-by-side comparison.",
+# ------------------------------------------------------- video (Full Width for maximum visibility)
+st.subheader("Annotated aerial view")
+versions = video_versions(tag)
+vid = versions[-1] if versions else suffixed("annotated", ".mp4", tag)
+if len(versions) > 1:
+    vid = st.selectbox(
+        "render version", list(reversed(versions)), index=0,
+        format_func=lambda p: os.path.basename(p) + (
+            "  (latest)" if p == versions[-1] else ""),
+        help="Renders are never overwritten, so earlier versions stay on disk "
+             "for side-by-side comparison.",
+    )
+root, ext = os.path.splitext(vid)
+web = f"{root}_web{ext}"
+playable = web if os.path.exists(web) else vid
+if os.path.exists(playable):
+    st.video(playable)
+    overlay_note = ""
+    cr = summary.get("contact_refinement", {})
+    if cr.get("enabled") and cr.get("masks_accepted"):
+        overlay_note = (
+            " The cyan bar under each vehicle is the MobileSAM tyre-contact line and "
+            "the short white stub is the correction away from the box bottom-centre; "
+            "trails follow the contact point, so the picture matches the numbers."
         )
-    root, ext = os.path.splitext(vid)
-    web = f"{root}_web{ext}"
-    playable = web if os.path.exists(web) else vid
-    if os.path.exists(playable):
-        st.video(playable)
-        overlay_note = ""
-        cr = summary.get("contact_refinement", {})
-        if cr.get("enabled") and cr.get("masks_accepted"):
-            overlay_note = (
-                " The cyan bar under each vehicle is the MobileSAM tyre-contact line and "
-                "the short white stub is the correction away from the box bottom-centre; "
-                "trails follow the contact point, so the picture matches the numbers."
-            )
-        st.markdown(
-            "<div class='caveat'>Bounding box, class, track ID, live speed and trajectory "
-            "trail per road user. Flagged objects switch to red/orange; potential conflicts "
-            f"are drawn as a line between the two interacting users.{overlay_note}</div>",
-            unsafe_allow_html=True,
+    st.markdown(
+        "<div class='caveat'>Bounding box, class, track ID, live speed and trajectory "
+        "trail per road user. Flagged objects switch to red/orange; potential conflicts "
+        f"are drawn as a line between the two interacting users.{overlay_note}</div>",
+        unsafe_allow_html=True,
+    )
+    if not os.path.exists(web):
+        st.caption(
+            "If the player shows nothing, the file is mp4v-encoded. Re-encode to H.264:"
         )
-        if not os.path.exists(web):
-            st.caption(
-                "If the player shows nothing, the file is mp4v-encoded. Re-encode to H.264:"
-            )
-            st.code(f"ffmpeg -i {vid} -vcodec libx264 -crf 28 -y {web}", language="bash")
-    else:
-        st.info("No annotated video for this run.")
+        st.code(f"ffmpeg -i {vid} -vcodec libx264 -crf 28 -y {web}", language="bash")
+else:
+    st.info("No annotated video for this run.")
 
-with right:
+st.divider()
+
+# ------------------------------------------------------- traffic summary & stats
+c_left, c_right = st.columns([1, 1], gap="large")
+
+with c_left:
     st.subheader("Traffic composition")
     by_class = counts.get("by_class", {})
     if by_class:
@@ -288,6 +290,7 @@ with right:
                     unsafe_allow_html=True,
                 )
 
+with c_right:
     st.subheader("Identity stability")
     stab = summary.get("id_stability", {})
     if stab:

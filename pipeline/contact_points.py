@@ -84,7 +84,50 @@ REFINED_COLUMNS = [
     "seg_r_x",
     "contact_w_px",
     "contact_source",
+    # The accepted mask itself, as a simplified outline: "x y;x y;...". Persisted
+    # so the annotated video can draw the REAL silhouette instead of a box, and so
+    # a re-render never has to re-run SAM. ~30 points per instance after
+    # approxPolyDP, which is a few hundred bytes - cheap next to re-segmenting.
+    "polygon",
 ]
+
+# Contour simplification tolerance, px. 1.2 keeps wheel arches and wing mirrors
+# recognisable at 1920 while cutting the raw contour to roughly a tenth its length.
+_POLY_EPS_PX = 1.2
+
+
+def _mask_polygon(mask: np.ndarray) -> str:
+    """
+    Largest external contour of `mask`, simplified, as "x y;x y;...".
+
+    Largest rather than all contours: SAM occasionally returns a speck alongside
+    the vehicle, and a stray 3 px island drawn on the video reads as a detection
+    that isn't there. Returns "" if the mask has no usable contour.
+    """
+    if cv2 is None or mask is None or not np.any(mask):
+        return ""
+    cnts, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not cnts:
+        return ""
+    c = max(cnts, key=cv2.contourArea)
+    approx = cv2.approxPolyDP(c, _POLY_EPS_PX, True).reshape(-1, 2)
+    if len(approx) < 3:
+        return ""
+    return ";".join(f"{int(x)} {int(y)}" for x, y in approx)
+
+
+def parse_polygon(s) -> np.ndarray | None:
+    """Inverse of `_mask_polygon`. Returns an (N,2) int32 array, or None."""
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        pts = [p.split() for p in s.split(";") if p]
+        arr = np.array([[int(a), int(b)] for a, b in pts], np.int32)
+    except Exception:
+        return None
+    return arr if len(arr) >= 3 else None
 
 # A mask with fewer pixels than this in its contact band cannot support a median.
 MIN_MASK_PIXELS = 24
@@ -259,18 +302,24 @@ def refine_contacts(
     max_frames: int | None = None,
     capture_frame: int | None = None,
     progress_every: int = 100,
-) -> tuple[pd.DataFrame, dict, np.ndarray | None]:
+) -> tuple[pd.DataFrame, dict, np.ndarray | None, np.ndarray | None]:
     """
     Second pass over the video, replacing box bottom-centres with mask contacts.
 
-    Returns (refined, info, vehicle_union):
-      refined       one row per (frame, track_id) that was processed, REFINED_COLUMNS
+    Returns (refined, info, vehicle_union, swept_union):
+      refined       one row per (frame, track_id) that was processed, REFINED_COLUMNS,
+                    including the simplified mask outline so the video can draw the
+                    real silhouette without ever re-running SAM
       info          measured coverage / rejection counts, JSON-serialisable
       vehicle_union uint8 union of accepted masks on `capture_frame`, or None.
                     Handed to `road_mask._occupied_mask` so the bare-road SAM
                     prompts can exclude actual vehicle PIXELS instead of whole
                     boxes - a free improvement to the road mask, since these masks
                     have already been paid for.
+      swept_union   uint8 union of every accepted mask across ALL processed frames:
+                    the area real vehicle silhouettes actually swept. This is the
+                    strongest road-area evidence the pipeline has, and it is a
+                    measurement rather than the lane-width guess it replaces.
 
     Never raises. Every failure path returns an empty table plus a note, exactly as
     `road_mask.sam_segments` does, so the caller falls back to the box point.
@@ -279,16 +328,16 @@ def refine_contacts(
     empty = pd.DataFrame(columns=REFINED_COLUMNS)
 
     if not ccfg.get("enabled", False):
-        return empty, {"enabled": False, "reason": "disabled in config"}, None
+        return empty, {"enabled": False, "reason": "disabled in config"}, None, None
     if cv2 is None:
-        return empty, {"enabled": False, "reason": "opencv unavailable"}, None
+        return empty, {"enabled": False, "reason": "opencv unavailable"}, None, None
     if boxes is None or boxes.empty or "frame" not in boxes:
-        return empty, {"enabled": False, "reason": "no boxes.csv to refine"}, None
+        return empty, {"enabled": False, "reason": "no boxes.csv to refine"}, None, None
 
     try:
         from ultralytics import SAM
     except Exception as exc:
-        return empty, {"enabled": False, "reason": f"ultralytics SAM unavailable: {exc}"}, None
+        return empty, {"enabled": False, "reason": f"ultralytics SAM unavailable: {exc}"}, None, None
 
     weights = (cfg.get("segmentation", {}) or {}).get("sam_weights", "mobile_sam.pt")
     refine_stride = max(1, int(ccfg.get("stride", 1)))
@@ -303,15 +352,16 @@ def refine_contacts(
     try:
         model = SAM(weights)
     except Exception as exc:
-        return empty, {"enabled": False, "reason": f"could not load {weights}: {exc}"}, None
+        return empty, {"enabled": False, "reason": f"could not load {weights}: {exc}"}, None, None
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return empty, {"enabled": False, "reason": f"cannot open video: {video_path}"}, None
+        return empty, {"enabled": False, "reason": f"cannot open video: {video_path}"}, None, None
 
     box_by_frame = {int(f): g for f, g in boxes.groupby("frame")}
     rows: list[dict] = []
     vehicle_union: np.ndarray | None = None
+    swept_union: np.ndarray | None = None
 
     n_frames_refined = 0
     n_prompted = 0
@@ -401,6 +451,14 @@ def refine_contacts(
                 n_accepted += 1
                 if capture_here and vehicle_union is not None:
                     vehicle_union[mask] = 255
+                # Every accepted silhouette, every frame, painted into one
+                # accumulator. Vehicles sweep the carriageway as they drive, so this
+                # is a MEASURED drivable area built from real vehicle outlines -
+                # strictly better evidence than dilating trajectory centre-points by
+                # a guessed lane width. Costs one uint8 frame of memory.
+                if swept_union is None:
+                    swept_union = np.zeros((h, w), np.uint8)
+                swept_union[mask] = 255
 
                 rows.append(
                     {
@@ -412,6 +470,7 @@ def refine_contacts(
                         "seg_r_x": round(r_x, 2),
                         "contact_w_px": round(r_x - l_x, 2),
                         "contact_source": "mask",
+                        "polygon": _mask_polygon(mask),
                     }
                 )
 
@@ -449,7 +508,7 @@ def refine_contacts(
         )
     if n_accepted == 0:
         info["outcome"] = "no mask survived vetting -> box bottom-centre kept everywhere"
-    return refined, info, vehicle_union
+    return refined, info, vehicle_union, swept_union
 
 
 # --------------------------------------------------------------------------
