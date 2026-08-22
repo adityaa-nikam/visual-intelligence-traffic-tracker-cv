@@ -179,6 +179,7 @@ def main() -> int:
     contact_info: dict = {"enabled": False, "reason": "not requested"}
     merge_stats: dict = {"applied": False}
     vehicle_union = None
+    swept_union = None
     refined = pd.DataFrame()
 
     reuse = args.from_trajectories
@@ -206,7 +207,7 @@ def main() -> int:
             # detection, so MobileSAM can re-anchor an existing run without paying for
             # YOLO again. This is what makes the bbox-vs-mask A/B cheap enough to run.
             print("[3/7] contact-point refinement (MobileSAM instance masks)")
-            refined, contact_info, vehicle_union = contact_mod.refine_contacts(
+            refined, contact_info, vehicle_union, swept_union = contact_mod.refine_contacts(
                 video_path, boxes, cfg, frame_stride=stride, max_frames=max_frames,
                 capture_frame=seg_frame_index,
             )
@@ -276,7 +277,7 @@ def main() -> int:
         # describing the old anchor. See pipeline/contact_points.py.
         if refine_on:
             print("[3/7] contact-point refinement (MobileSAM instance masks)")
-            refined, contact_info, vehicle_union = contact_mod.refine_contacts(
+            refined, contact_info, vehicle_union, swept_union = contact_mod.refine_contacts(
                 video_path, boxes, cfg, frame_stride=stride, max_frames=max_frames,
                 capture_frame=seg_frame_index,
             )

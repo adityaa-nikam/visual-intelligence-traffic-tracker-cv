@@ -292,21 +292,54 @@ def build_road_mask(
     boxes: pd.DataFrame | None = None,
     frame_index: int = 0,
     vehicle_mask: np.ndarray | None = None,
+    swept_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
     Combine the empirical and geometric estimates into one drivable-area mask.
 
     `vehicle_mask` is the optional union of the instance masks the contact-point
     pass already produced for `frame_index` - if supplied, seeds avoid vehicle
-    PIXELS rather than whole detection boxes. Returns (mask_uint8, info). `info`
-    carries the measured agreement between the two independent estimates, so the
-    mask's quality is reported rather than assumed.
+    PIXELS rather than whole detection boxes.
+
+    `swept_mask` is the union of EVERY accepted instance mask over every processed
+    frame. When present it replaces the dilated-trajectory estimate as the empirical
+    evidence, and that is a large accuracy win: the old estimate rasterised
+    trajectory CENTRE POINTS and dilated them by a guessed `lane_width_px`, so its
+    width was a tunable guess and its shape was a string of overlapping discs (the
+    characteristic lumpy amoeba). A swept union is the actual area real vehicle
+    silhouettes covered - correct width by construction, no free parameter, and it
+    reaches the true lane edges wherever traffic did.
+
+    Returns (mask_uint8, info). `info` carries the measured agreement between the
+    two independent estimates, so the mask's quality is reported rather than assumed.
     """
     scfg = cfg.get("segmentation", {}) or {}
     h, w = frame.shape[:2]
 
     lane_px = int(scfg.get("lane_width_px", 26))
-    trav = travelled_mask(obs, (h, w), lane_width_px=lane_px)
+    swept_ok = swept_mask is not None and np.any(swept_mask)
+    if swept_ok:
+        sw = swept_mask
+        if sw.shape[:2] != (h, w):
+            sw = cv2.resize(sw, (w, h), interpolation=cv2.INTER_NEAREST)
+        trav = (sw > 0).astype(np.uint8) * 255
+        # Close across the gaps BETWEEN passes. Consecutive vehicles leave a dotted
+        # trail at any finite frame rate, and adjacent lanes are only bridged where
+        # something drove the line between them; one close at roughly a lane width
+        # turns that into continuous carriageway without inflating its outer edge.
+        close_px = int(scfg.get("swept_close_px", max(lane_px, 25)))
+        trav = smooth_mask(trav, close_k=close_px, blur_k=max(3, close_px // 3))
+        trav_source = (
+            f"union of {int((sw > 0).sum())} px of accepted vehicle instance masks "
+            f"swept over all processed frames, closed by {close_px}px"
+        )
+    else:
+        trav = travelled_mask(obs, (h, w), lane_width_px=lane_px)
+        trav_source = (
+            f"trajectory centre-points dilated by lane_width_px={lane_px} - a GUESS; "
+            "run with segmentation.contact.enabled to replace this with the measured "
+            "swept area of real vehicle silhouettes"
+        )
     trav_frac = float((trav > 0).mean())
 
     info = {
@@ -315,10 +348,11 @@ def build_road_mask(
             "drone hovers (altitude spread 0.023 m, pitch 0.0 deg, yaw 0.4 deg over "
             "6824 telemetry records), so one mask serves every frame"
         ),
+        "empirical_source": trav_source,
         "travelled_area_frac": round(trav_frac, 4),
         "sam": None,
         "agreement": None,
-        "source": "travelled_only",
+        "source": "swept_only" if swept_ok else "travelled_only",
     }
 
     sam = None
@@ -368,7 +402,7 @@ def build_road_mask(
     # minute (empty lanes, far arms) included, while the travelled mask guarantees
     # we never lose road we have direct evidence for.
     combined = smooth_mask(cv2.bitwise_or(trav, sam), close_k=25, blur_k=15)
-    info["source"] = "sam_union_travelled"
+    info["source"] = "sam_union_swept" if swept_ok else "sam_union_travelled"
     info["road_area_frac"] = round(float((combined > 0).mean()), 4)
     return combined, info
 
