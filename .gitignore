@@ -1,0 +1,30 @@
+# Videos and telemetry - far too large for git
+data/
+*.mp4
+*.MP4
+*.srt
+
+# Model weights (downloaded on demand by ultralytics)
+models/
+*.pt
+
+# Pipeline outputs - regenerable, and annotated.mp4 alone is ~380MB
+outputs/
+colab_outputs/
+*.log
+
+# Bundles
+traffic_ai_code.zip
+traffic_ai_outputs.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ultralytics, torch; print\\('ultralytics', ultralytics.__version__\\); print\\('torch', torch.__version__, 'cuda', torch.cuda.is_available\\(\\)\\)\")",
+      "WebFetch(domain:docs.ultralytics.com)",
+      "Bash(python -m py_compile app.py)",
+      "Bash(python tests/test_contact_points.py)"
+    ]
+  }
+}

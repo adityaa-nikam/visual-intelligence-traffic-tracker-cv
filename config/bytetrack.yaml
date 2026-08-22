@@ -1,0 +1,11 @@
+# ByteTrack settings tuned for aerial traffic footage.
+# The defaults drop identities too eagerly when vehicles pass under trees,
+# behind buses, or sit still at a red light. A long track_buffer is the single
+# highest-value change for "stable identity through occlusion / long dwell".
+tracker_type: bytetrack
+track_high_thresh: 0.25   # detections that start/continue a confident track
+track_low_thresh: 0.08    # ByteTrack's second association pass (recovers occluded objects)
+new_track_thresh: 0.30    # a bit strict, to avoid ID churn on partial detections
+track_buffer: 90          # ~3 s at 30 fps: survives occlusion and missed detections
+match_thresh: 0.85
+fuse_score: true

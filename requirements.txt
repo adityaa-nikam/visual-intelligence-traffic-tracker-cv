@@ -1,0 +1,22 @@
+# Traffic Intelligence - Level 1
+# Python 3.10+
+#
+# GPU note: install a CUDA build of torch for real speed. On a laptop CPU expect
+# ~1 fps at imgsz=1280; a Colab T4 does ~20-25 fps.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+ultralytics>=8.3.0      # YOLOv8 detector + bundled ByteTrack tracker
+torch>=2.2.0
+torchvision>=0.17.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.11.0           # cKDTree: neighbour search for queues and interactions
+lap>=0.4.0              # linear assignment used by ByteTrack
+PyYAML>=6.0
+streamlit>=1.32.0       # dashboard
+plotly>=5.18.0          # dashboard charts
+
+# ffmpeg must be on PATH (clip extraction + DJI telemetry subtitle extraction).
+#   Windows: winget install Gyan.FFmpeg
+#   Linux:   apt-get install ffmpeg
