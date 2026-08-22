@@ -27,11 +27,52 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def _label(img, text, org, colour, scale=0.45, thick=1, pad=3):
-    """Text with a filled backing box so it stays readable over any road surface."""
-    (w, h), base = cv2.getTextSize(text, FONT, scale, thick)
+    """
+    Text with a filled backing box so it stays readable over any road surface.
+
+    Accepts "\n" and stacks lines, so a caller can put the identity on one line and
+    the speed under it instead of running them together. The box is clamped to the
+    frame, which matters at the right-hand edge where a label used to be drawn
+    partly off-canvas and silently cropped.
+    """
+    lines = str(text).split("\n")
+    sizes = [cv2.getTextSize(ln, FONT, scale, thick) for ln in lines]
+    tw = max(w for (w, _), _ in sizes)
+    lh = max(h for (_, h), _ in sizes) + 4
+    bw, bh = tw + pad * 2, lh * len(lines) + pad * 2
+
     x, y = int(org[0]), int(org[1])
-    cv2.rectangle(img, (x, y - h - pad * 2), (x + w + pad * 2, y + base - 1), colour, -1)
-    cv2.putText(img, text, (x + pad, y - pad), FONT, scale, (18, 18, 18), thick, cv2.LINE_AA)
+    x = max(0, min(x, img.shape[1] - bw))
+    y = max(bh, min(y, img.shape[0] - 1))
+
+    cv2.rectangle(img, (x, y - bh), (x + bw, y), colour, -1)
+    for i, ln in enumerate(lines):
+        cv2.putText(img, ln, (x + pad, y - bh + pad + lh * (i + 1) - 4),
+                    FONT, scale, (18, 18, 18), thick, cv2.LINE_AA)
+
+
+def _trail_points(hist: np.ndarray, max_jump_px: float) -> list[np.ndarray]:
+    """
+    Split one track's history into continuous runs, dropping implausible jumps.
+
+    A single bad position - a tracker ID swap, or a box snapping to a different
+    vehicle - otherwise draws a straight line clean across the frame. Breaking the
+    polyline at the jump is better than either connecting it (a fake path) or
+    dropping the whole track (losing a real one). Consecutive duplicate points are
+    collapsed so a stopped vehicle does not accumulate thousands of identical
+    vertices.
+    """
+    if len(hist) < 2:
+        return []
+    pts = hist[:, 1:3].astype(np.float64)
+    runs: list[list[np.ndarray]] = [[pts[0]]]
+    for k in range(1, len(pts)):
+        d = float(np.hypot(*(pts[k] - pts[k - 1])))
+        if d > max_jump_px:
+            runs.append([pts[k]])            # break: start a new polyline
+        elif d >= 0.75:                      # drop duplicate / sub-pixel repeats
+            runs[-1].append(pts[k])
+    return [np.array(r, np.int32) for r in runs if len(r) > 1]
 
 
 def _alpha_rect(img, p1, p2, colour, alpha=0.55):
@@ -61,6 +102,11 @@ def render_annotated_video(
     road_mask: np.ndarray | None = None,
     use_contact_anchor: bool = False,
     draw_contacts: bool = False,
+    dim_off_road: bool = False,
+    min_confirm_frames: int = 0,
+    max_jump_px: float | None = None,
+    show_events: bool = True,
+    compact_labels: bool = False,
 ) -> dict:
     """
     Draw boxes, IDs, classes, speeds, trails, anomaly markers and a live HUD.
@@ -73,6 +119,28 @@ def render_annotated_video(
     measured. `draw_contacts` additionally overlays the tyre-contact line and a
     connector from the box point to it - the visible proof of the correction,
     drawn from the persisted numbers rather than by re-running segmentation.
+
+    Presentation controls, all defaulting to the CLEAN reading of the scene:
+
+    `dim_off_road` darkens everything outside `road_mask` to 42%. It is off by
+    default because it is what produced the "giant white blob" - the road mask is
+    built by dilating trajectory corridors (`road_mask.travelled_mask`), so against
+    a dimmed surround it reads as a fat merged trajectory smear rather than as the
+    road-area estimate it is. The mask is still computed, measured and saved to
+    `road_mask.png`; it just no longer repaints the video.
+
+    `min_confirm_frames` hides tracks whose total observed length is below it, so a
+    one- or two-frame false positive never reaches the screen or the HUD count.
+    Applied at RENDER time only - the analytics keep every observation, so this
+    changes presentation, never the measurements.
+
+    `max_jump_px` breaks a trail where consecutive positions are further apart than
+    this, instead of drawing a line across the frame. Defaults to 4% of the frame
+    diagonal, which at 1920x1080 is ~88 px, or ~2.9 m at this altitude - about
+    320 km/h between frames, so it only ever catches an ID swap, never real motion.
+
+    `show_events` draws the anomaly/conflict overlays. `compact_labels` uses the
+    two-line "#42 - car / 32 km/h" form instead of one run-together line.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():

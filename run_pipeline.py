@@ -332,6 +332,9 @@ def main() -> int:
                 obs, seg_frame, cfg, boxes=boxes,
                 frame_index=int(cfg["segmentation"].get("frame_index", 0)),
                 vehicle_mask=vehicle_union,
+                # The area real vehicle silhouettes actually swept, measured in the
+                # contact-point pass. Replaces the dilated-centre-point guess.
+                swept_mask=swept_union,
             )
             ov = road_mask_mod.render_mask_overlay(
                 seg_frame, road_mask, out_path("road_mask", ".png")
