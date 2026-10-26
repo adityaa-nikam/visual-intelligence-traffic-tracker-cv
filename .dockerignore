@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+*.log
+outputs
+colab_outputs
+data
+models
+*.mp4
+*.MP4
+*.srt
+traffic_ai_code.zip
+traffic_ai_outputs.zip

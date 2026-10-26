@@ -143,6 +143,10 @@ def build_track_summary(df: pd.DataFrame, cfg: dict, calibrated: bool) -> pd.Dat
                 "turn_delta_deg": round(turn_delta, 1) if turn_delta == turn_delta else np.nan,
                 "turn_type": turn_type,
                 "footprint_p90_m": round(float(g["footprint_m"].quantile(0.9)), 2) if calibrated and g["footprint_m"].notna().any() else np.nan,
+                # Measured ground dimensions - the evidence behind the fine-grained
+                # class. Every classified track carries the number that classified it.
+                "length_m": round(float(g["length_m"].median()), 2) if "length_m" in g and g["length_m"].notna().any() else np.nan,
+                "width_m": round(float(g["width_m"].median()), 2) if "width_m" in g and g["width_m"].notna().any() else np.nan,
                 "last_x": round(float(g["x"].iloc[-1]), 1),
                 "last_y": round(float(g["y"].iloc[-1]), 1),
             }
@@ -394,3 +398,130 @@ def id_stability_stats(df: pd.DataFrame, summary: pd.DataFrame, fps: float, stri
         "gap_recoveries": recoveries,
         "longest_bridged_gap_s": round(longest_gap, 2),
     }
+
+# Hardest braking a road vehicle can physically achieve is about 1 g on dry
+# tarmac; anything past this is a measurement artefact, not a manoeuvre.
+PHYSICAL_ACCEL_LIMIT_MS2 = 10.0
+
+
+def build_kinematics(df: pd.DataFrame, summary: pd.DataFrame, cfg: dict,
+                     calibrated: bool) -> tuple[pd.DataFrame, dict]:
+    """
+    LEVEL 2 deliverable: per-object velocity and acceleration in REAL units.
+
+    The per-observation speed/acceleration already live in trajectories.csv; this
+    condenses them to one row per road user, which is the form the deliverable
+    asks for and the form a traffic engineer actually reads.
+
+    Honesty about the units
+    -----------------------
+    km/h and m/s^2 are only reported when telemetry calibration succeeded, because
+    they come from the pinhole projection onto the ground plane - not from a guess
+    about scale. Without calibration these columns stay empty and only px/s is
+    reported, rather than dressing up pixel motion as a physical speed.
+
+    Acceleration is differentiated from an already-smoothed speed, so it is a
+    trend over ~0.5 s, not an instantaneous g-force. A single frame of box jitter
+    on a 20 px motorcycle would otherwise read as several m/s^2.
+    """
+    if df.empty:
+        return pd.DataFrame(), {}
+
+    acfg = cfg["analytics"]
+    still = float(acfg.get("stationary_speed_kph", 3.0))
+    rows = []
+    for tid, g in df.sort_values(["track_id", "frame"]).groupby("track_id", sort=False):
+        v = g["speed_kph"].to_numpy(dtype=float) if calibrated else np.full(len(g), np.nan)
+        a = g["accel_kph_s"].to_numpy(dtype=float) if calibrated else np.full(len(g), np.nan)
+        vpx = g["speed_px_s"].to_numpy(dtype=float)
+        moving = v > still if calibrated else vpx > 0
+        # m/s^2 is the unit an engineer expects for acceleration; 1 km/h/s = 0.2778 m/s^2.
+        a_ms2 = a / 3.6
+        rows.append({
+            "track_id": int(tid),
+            "class": g["class"].iloc[0],
+            "n_obs": int(len(g)),
+            "duration_s": round(float(g["timestamp"].iloc[-1] - g["timestamp"].iloc[0]), 2),
+            # Two speeds, because they answer different questions: journey speed
+            # includes the time spent stopped at the signal, cruise speed does not.
+            "mean_speed_kph": _r(np.nanmean(v) if np.isfinite(v).any() else np.nan),
+            "mean_moving_speed_kph": _r(np.nanmean(v[moving]) if moving.any() else np.nan),
+            "median_speed_kph": _r(np.nanmedian(v[moving]) if moving.any() else np.nan),
+            "p85_speed_kph": _r(np.nanpercentile(v[moving], 85) if moving.any() else np.nan),
+            # p98 is the headline peak; the raw max is a handful of frames of box
+            # jitter on a 20 px object and is kept only for audit.
+            "p98_speed_kph": _r(np.nanpercentile(v, 98) if np.isfinite(v).any() else np.nan),
+            "max_speed_kph": _r(np.nanmax(v) if np.isfinite(v).any() else np.nan),
+            "mean_speed_ms": _r(np.nanmean(v[moving]) / 3.6 if moving.any() else np.nan),
+            # ACCELERATION, robust percentiles first. The raw extremes are not
+            # physical: box corners jitter by a pixel or two between frames, which
+            # differentiates into tens of m/s^2. Reporting p95/p5 keeps the real
+            # signal (a vehicle braking for the stop line) and discards the spike.
+            "p95_accel_ms2": _r(np.nanpercentile(a_ms2, 95) if np.isfinite(a_ms2).any() else np.nan),
+            "p5_decel_ms2": _r(np.nanpercentile(a_ms2, 5) if np.isfinite(a_ms2).any() else np.nan),
+            "max_accel_ms2_raw": _r(np.nanmax(a_ms2) if np.isfinite(a_ms2).any() else np.nan),
+            "max_decel_ms2_raw": _r(np.nanmin(a_ms2) if np.isfinite(a_ms2).any() else np.nan),
+            "mean_abs_accel_ms2": _r(np.nanmean(np.abs(a_ms2)) if np.isfinite(a_ms2).any() else np.nan),
+            # Flag rather than silently clip, so the number stays auditable.
+            "accel_exceeds_physical": bool(
+                np.isfinite(a_ms2).any() and np.nanmax(np.abs(a_ms2)) > PHYSICAL_ACCEL_LIMIT_MS2),
+            "moving_fraction": _r(float(np.mean(moving)) if len(moving) else np.nan),
+            "mean_speed_px_s": _r(np.nanmean(vpx)),
+            "units": "km/h and m/s^2" if calibrated else "px/s only - uncalibrated",
+            "basis": ("telemetry-calibrated ground plane (estimate)" if calibrated
+                      else "image space - no metric scale available"),
+        })
+    kin = pd.DataFrame(rows)
+
+    if not summary.empty and "length_m" in summary:
+        kin = kin.merge(summary[["track_id", "length_m", "width_m", "class_source"]],
+                        on="track_id", how="left")
+
+    stats = {}
+    if calibrated and not kin.empty:
+        by_class = (kin.groupby("class")
+                    .agg(road_users=("track_id", "size"),
+                         mean_journey_speed_kph=("mean_speed_kph", "mean"),
+                         mean_moving_speed_kph=("mean_moving_speed_kph", "mean"),
+                         p85_speed_kph=("p85_speed_kph", "mean"),
+                         # Median of the per-track robust peaks: what a typical
+                         # member of this class actually does, not the worst frame
+                         # of the worst track.
+                         typical_accel_ms2=("p95_accel_ms2", "median"),
+                         typical_decel_ms2=("p5_decel_ms2", "median")).round(2))
+        n_flag = int(kin["accel_exceeds_physical"].sum())
+        clean = kin[~kin["accel_exceeds_physical"]]
+        stats = {
+            "road_users": int(len(kin)),
+            "speed_unit": "km/h", "acceleration_unit": "m/s^2",
+            "by_class": {c: r.to_dict() for c, r in by_class.iterrows()},
+            "fleet_mean_speed_kph": _r(kin["mean_speed_kph"].mean()),
+            # Fleet extremes are taken over the tracks whose acceleration stayed
+            # inside the physical envelope. On a short track p5 is nearly the raw
+            # minimum, so a jitter spike survives the percentile and would set the
+            # fleet record on its own.
+            "hardest_braking_ms2": _r(clean["p5_decel_ms2"].min()) if len(clean) else None,
+            "hardest_accel_ms2": _r(clean["p95_accel_ms2"].max()) if len(clean) else None,
+            "extremes_computed_over_tracks": int(len(clean)),
+            "tracks_with_implausible_accel_spike": n_flag,
+            "physical_accel_limit_ms2": PHYSICAL_ACCEL_LIMIT_MS2,
+            "method": ("per-observation speed = centred difference of smoothed "
+                       "ground coordinates over a ~0.5 s baseline; acceleration = "
+                       "smoothed derivative of that speed; headline figures are "
+                       "p95/p5 per track, not the raw extremes"),
+            "caveat": ("estimates from a single hovering camera. The RAW per-track "
+                       f"acceleration extremes reach {_r(kin['max_accel_ms2_raw'].max())} m/s^2, "
+                       "which is not physical - a pixel of box jitter differentiates "
+                       "into tens of m/s^2 on a small object. Raw columns are kept "
+                       "in kinematics.csv for audit but are not reported as results."),
+        }
+    return kin, stats
+
+
+def _r(v, nd: int = 2):
+    """Round, tolerating NaN, so a missing measurement stays missing."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return np.nan
+    return round(f, nd) if np.isfinite(f) else np.nan

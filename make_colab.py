@@ -47,10 +47,10 @@ else:
 
     (MD, """## 2. Install dependencies
 
-Colab already has torch, OpenCV, pandas, scipy and ffmpeg. We only need Ultralytics
-(YOLO + ByteTrack) and `lap` for the tracker's assignment step."""),
+Colab already supplies the numerical stack (PyTorch, OpenCV, pandas, scipy and
+PyYAML). Install the detector, tracker assignment, and pinned-model downloader."""),
 
-    (CODE, """!pip install -q ultralytics lap
+    (CODE, """!pip install -q ultralytics lap huggingface_hub
 import ultralytics; print('ultralytics', ultralytics.__version__)"""),
 
     (MD, """## 3. Get the pipeline code
@@ -89,6 +89,14 @@ for d in ('data', 'outputs', 'models'):
 
 print('\\ncwd     :', os.getcwd())
 print('pipeline:', sorted(os.listdir('pipeline')))"""),
+
+    (MD, """### Install the pinned aerial detector
+
+The upload pipeline uses a VisDrone-trained detector because ordinary COCO
+weights often miss vehicles in top-down video. The downloader verifies the
+checkpoint checksum and class order before inference."""),
+
+    (CODE, """!python tools/download_aerial_model.py"""),
 
     (MD, """## 4. Get the drone video from Google Drive
 
@@ -146,9 +154,11 @@ Each record carries:
 [rel_alt: 70.472 abs_alt: 607.273] [gb_yaw: -125.5 gb_pitch: -63.1 gb_roll: 0.0]
 ```
 
-Altitude + focal length + gimbal angles are exactly enough to project any pixel onto
-the road plane and get **metres**. Without this we could only report pixel velocities,
-and quoting km/h would be fabrication."""),
+For nearly static footage, altitude + focal length + gimbal angles can project pixels
+onto the road plane and estimate **metres**. The pipeline checks the selected SRT time
+range and rejects a single-pose calibration if the camera appears to move. Without
+accepted calibration it reports image-space speeds and disables physical conflict
+grading."""),
 
     (CODE, """!ffprobe -v error -select_streams v:0 \\
   -show_entries stream=width,height,r_frame_rate,nb_frames,duration \\
@@ -214,7 +224,12 @@ cfg['video']['max_frames']   = None
 cfg['telemetry']['srt_path'] = SRT
 cfg['detector']['device']    = 'auto'   # -> cuda
 cfg['detector']['half']      = True     # fp16 on the T4
-cfg['detector']['weights']   = 'models/yolov8s.pt'
+cfg['detector']['weights']   = 'models/best.pt'
+cfg['detector']['classes']   = list(range(10))
+cfg['detector']['imgsz']     = 1280
+cfg['detector']['conf']      = 0.10
+cfg['detector']['strict_conf'] = 0.20
+cfg['detector']['small_conf']  = 0.08
 
 yaml.safe_dump(cfg, open('config/config.yaml', 'w'), sort_keys=False)
 print(yaml.safe_dump(cfg, sort_keys=False))"""),
@@ -389,11 +404,11 @@ the data can and cannot support.
 
 | Area | Limitation |
 |---|---|
-| **LGV vs HGV** | COCO has no LGV/HGV classes. We split the model's `truck` detections by measured ground footprint and record `class_source=size_heuristic_from_calibration`. Never presented as a model output. |
-| **Speed** | Estimate. Assumes flat ground and uses the box bottom as the contact point. Reported only when telemetry calibration succeeds - otherwise px/s, never fake km/h. |
+| **Model classes** | VisDrone is aerial-trained; van maps to LGV and three-wheel categories map to motorcycle. Grouping does not imply those vehicle types are identical. |
+| **Speed** | Estimate. Assumes flat ground and uses the box bottom as the contact point. Reported only when telemetry calibration passes its pose checks - otherwise px/s, never fake km/h. |
 | **Stationary vehicles** | Labelled *candidates*. A single clip cannot separate a breakdown from a red light, so we cross-reference detected queues and say so in the event description. |
 | **Wrong way** | Relative to the *observed dominant flow* of that part of the road, learned from the data. With no HD map we report a flow anomaly, not a legal violation. |
-| **Conflicts** | Constant-velocity projection; it cannot know a driver was already braking. Hence "potential conflict", filtered by closing rate and temporal persistence. |
+| **Conflicts** | Metric-calibrated constant-velocity projection; unavailable without metric calibration, and cannot know a driver was already braking. |
 | **Congestion** | A transparent weighted score for operator triage, not a certified level of service (that needs lane geometry and capacity). |
 | **Coordinates** | Metres relative to the aircraft, not a survey datum. GPS is recorded so results could be georeferenced. |"""),
 ]

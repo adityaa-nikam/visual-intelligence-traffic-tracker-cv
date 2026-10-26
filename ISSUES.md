@@ -356,89 +356,411 @@ ffmpeg -i outputs/annotated.mp4 -vcodec libx264 -crf 28 -pix_fmt yuv420p outputs
 
 ---
 
-## 17. Every position in the system belonged to no part of the vehicle
+## 17. Seeding SAM with trajectory points segmented the cars, not the road
 
-**Problem.** Nothing crashed and no number looked wrong. But `calibration.py` had a
-comment conceding *"a box bottom is still an approximation"*, and that approximation was
-the anchor for **every** metre, km/h and bearing the system reported.
+**Problem.** Road segmentation was added so analytics could use the *carriageway* as a
+denominator instead of the whole frame (a frame is mostly rooftops and vegetation).
+MobileSAM was chosen: ~40 MB, already inside `ultralytics`, no new dependency, and
+because the drone **hovers** it only has to run on a single frame.
 
-**Diagnosis.** Computed from the telemetry rather than assumed. The gimbal sits at
-**-63 deg pitch, not nadir**. With `f_px = (24/36) * 1920 = 1280`, the vertical FOV is
-45.7 deg and the optical axis is 27 deg off nadir, so the frame spans **4.1 deg off-nadir
-at the bottom edge to 49.9 deg at the top**. An elevated point projects displaced
-radially outward from the nadir by `height * tan(off-nadir)`:
+SAM needs prompts. The obvious choice was to prompt it at the trajectory points -
+after all, those are on the road. The mask came back with a measured agreement of
+**IoU 0.342**, and SAM covered only **35.8%** of the area traffic had demonstrably
+driven over, while its own masks covered just 10.5% of the frame.
 
-| object | h | bottom (4 deg) | centre (27 deg) | top (50 deg) |
+**Diagnosis.** The tell was in the log line: *24 prompts -> 24 segments*. Exactly one
+segment per prompt. SAM is **class-agnostic** - it returns *the object under the
+point*, and a trajectory point sits on a **vehicle**. We had asked SAM to segment the
+road and it had faithfully segmented 24 cars.
+
+**Fix.** Put the prompts on **bare carriageway**:
+
+- exclude any candidate covered by a detection box in the frame being segmented -
+  `boxes.csv` already records exactly that, and because the aircraft hovers, road a
+  vehicle drove over at t=30 s is bare tarmac at t=0;
+- take at most one candidate per 96 px grid cell, so prompts spread across every arm
+  of the junction instead of clustering in the busiest lane.
+
+SAM's coverage of the travelled area went **35.8% -> 56.7%**, and its own mask area
+went 10.5% -> 27.6% - now comparable to the 26.1% the traffic actually used.
+
+---
+
+## 18. The road mask then included a rooftop and a tree canopy
+
+**Problem.** With better seeds, SAM contributed much more area - and the union of
+"SAM" plus "where traffic drove" now contained a large grey **rooftop** and a big
+**tree canopy**. Visible immediately in the overlay image.
+
+**Diagnosis.** Same root cause as #17, pointing the other way. SAM has no concept of
+"road". Prompted on tarmac, it grows the segment by appearance, and a grey rooftop
+looks like grey tarmac from 70 m up. This is not a tuning problem - a class-agnostic
+model cannot be tuned into having a class.
+
+The consequence would have been silent and bad: the whole point of the mask is to
+report density **per square metre of road**, and a rooftop in the denominator makes
+that number meaningless.
+
+**Fix.** Stop treating SAM as an authority and make it a **proposer**:
+
+> **SAM proposes, the observed traffic vouches.**
+
+Keep the segments separately rather than merging them, then accept a segment only if
+at least 45% of *its own area* lies inside the travelled mask. A road segment
+extending an in-use corridor into its empty lanes passes. A rooftop overlaps the
+travelled area at roughly zero and is rejected.
+
+On this footage **13 of 28 segments were rejected**, IoU rose **0.342 -> 0.468**, and
+the final mask covers 27.2% of the frame against the 26.1% traffic proved - i.e.
+deliberately conservative. The asymmetry is intentional: an over-inclusive road mask
+is worse than a slightly tight one.
+
+Off-road detections are **dimmed in the video but kept in the analytics** by default,
+because a detection on a verge or footpath may well be a real road user - and
+pedestrians are exempt from filtering entirely. Deleting vulnerable road users to
+tidy up a mask would be exactly the wrong trade for a safety system.
+
+---
+
+## 19. "Small object detection" is a claim, so we measured it
+
+**Problem.** Aerial video is fundamentally a small-object problem: at 70 m a
+motorcycle is a few dozen pixels. The textbook responses are to infer at higher
+resolution and to lower the confidence floor. Both also buy false positives, so
+"we enabled small-object detection" is not a result.
+
+**Diagnosis.** `tools/measure_small_objects.py` runs three settings over the same 30
+frames sampled evenly across the clip, and reports detections bucketed by **pixel
+area** plus the fraction landing **inside the road mask** - reusing the segmentation
+from #17/#18, so the two features validate each other.
+
+| Setting | Detections | tiny (<400 px) | small | medium | large | on-road | median conf |
+|---|---|---|---|---|---|---|---|
+| 1280, conf 0.25 (baseline) | 1,250 | 92 | 503 | 636 | 19 | **87.6%** | 0.522 |
+| **1920, conf 0.25** | **1,975** (+58%) | **535** | 743 | 677 | 20 | **79.5%** | 0.469 |
+| 1920, conf 0.15 | 3,164 (+153%) | 1,140 | 1,055 | 916 | 53 | **64.9%** | 0.315 |
+
+**What decided it.** Not the headline count - the *shape* of the change.
+
+Going 1280 -> 1920 added **+443 tiny** and +240 small detections but only **+41
+medium and +1 large**. That is precisely what extra resolution should do if the gain
+is real: more pixels cannot reveal a bus you were already seeing. Tiny detections
+rose **5.8x** (92 -> 535), and 79.5% of all detections still landed on the
+carriageway.
+
+Dropping conf to 0.15 behaves like noise instead. It added +280 medium and +34
+**large** detections - resolution was unchanged, so a lower floor cannot be finding
+genuinely new large vehicles, it is admitting duplicates and junk. On-road fraction
+collapses to **64.9%**: more than a third of detections sit on rooftops and
+vegetation, which is the signature of hallucination, not recall.
+
+**Fix.** Adopt `imgsz: 1920` at `conf: 0.25`. **Reject `conf: 0.15`** despite it
+having by far the biggest detection count.
+
+The cost is honest: 1920 inference is roughly 2.2x slower per frame than 1280, which
+on a CPU-only machine is the difference between a ~25 minute and a ~55 minute pass.
+On the Colab T4 it is free. `summary.json` records `imgsz` for every run, so which
+setting produced which artifact is never ambiguous.
+
+We do **not** claim a recall or precision figure. There is no hand-labelled ground
+truth for this clip, so what is honestly available is the measured delta plus the
+evidence about its plausibility - which is what the table above is.
+
+---
+
+## 20. Trajectory trails vanished behind the vehicle
+
+**Problem.** Trails were drawn over a fixed 45-frame window, so a car's path faded
+out about 1.5 s behind it. Watching the video, you could not see that an ID had
+survived a long occlusion - which is the single thing Level 1 is scored on.
+
+**Diagnosis.** Not a bug; the window was chosen to stop the frame turning into
+spaghetti with 30+ simultaneous tracks. Both requirements are real and they conflict.
+
+**Fix.** Two layers instead of one. The **full history from first detection** is drawn
+thin at 45% brightness, so continuity is visible end to end; the **recent 45 frames**
+are drawn bright and thickening on top, so current motion still reads clearly. Cheap
+- both come from the same `trail_by_track` array already in memory.
+
+---
+
+## 21. Parked cars were reported as traffic anomalies
+
+**Problem.** `events.csv` reported 27 `unusual_dwell` anomalies. Looking at where they
+were, most were cars parked at the kerb for the entire clip.
+
+**Diagnosis.** The dwell detector asked "has this vehicle been stationary for more
+than 25 s?", which is true of a parked car and of a car stuck at a broken signal. The
+test could not tell them apart because it only looked at the duration of the stop, not
+at whether the vehicle ever moved.
+
+**Fix.** Compare stationary time against the vehicle's **whole observed life**. A
+vehicle stationary for >=90% of the time it was visible never made a journey, so it is a
+`parked_vehicle_candidate`, not an interrupted one. Output went from 27 dwell anomalies
+to 20 parked candidates and 7 genuine dwells - the same data, correctly separated.
+
+---
+
+## 22. Two-wheelers were barely detected, and the obvious fix made it worse
+
+**Problem.** Almost no motorcycles or bicycles were being detected at all.
+
+**Diagnosis.** Measured, not assumed: 24 evenly-spaced frames run at four resolutions.
+The first finding was an outright mistake in the config - the source video is **1920 wide
+and we were running the detector at 1280**, i.e. downscaling below native before asking
+it to find a 20 px object. YOLOv8's finest detection head has stride 8, so a 22 px
+motorcycle occupies under 3 grid cells at native and under 2 when downscaled.
+
+| setting | total detections | two-wheelers | tiny boxes (<600 px) | on-road plausibility |
 |---|---|---|---|---|
-| car | 1.5 m | 0.11 m | 0.76 m | 1.78 m |
-| pedestrian | 1.7 m | 0.12 m | 0.87 m | 2.02 m |
-| bus / hgv | 3.2 m | 0.23 m | 1.63 m | 3.80 m |
+| 1280, conf 0.25 | 1,504 | 13 | 448 | 0.80 |
+| **1920, conf 0.25** | 1,979 | **139** | 570 | 0.80 |
+| 2560, conf 0.25 | 2,201 | 70 | 645 | 0.78 |
+| 3200, conf 0.25 | 2,283 | 67 | 690 | 0.77 |
+| 1920, conf 0.15 | 3,412 | 259 | 1,102 | **0.65** |
 
-An axis-aligned box wraps the whole silhouette **including the roof**. Its bottom edge
-`y2` is the lowest silhouette pixel - roughly the near tyre line, about right - but its
-horizontal centre `(x1+x2)/2` is the centre of a silhouette stretched by that radial roof
-displacement. So `(cx, y2)` is a mongrel point: its `v` comes from the wheels and its `u`
-from a roof-contaminated average.
+**The intuitive fix was disproven by the measurement.** Upscaling *above* native keeps
+raising the raw count of tiny boxes, and yet finds **fewer** two-wheelers - a bicubic
+upsampled frame is out of distribution for the class head, so the extra boxes come back
+labelled "car". Dropping confidence to 0.15 does find 259 two-wheelers, but on-road
+plausibility collapses from 0.80 to 0.65, i.e. it is admitting rooftop clutter.
 
-Three things follow, and none of them depend on the exact magnitude:
+**Fix.** Native 1920, plus a **two-tier confidence floor**, because one threshold cannot
+serve both ends of the size range: a car at 70 m scores 0.5+, a motorcycle scores
+0.15-0.25. Detection is proposed at 0.15 so small road users exist at all, then car / bus
+/ truck are held to 0.25 while two-wheelers and pedestrians stay at 0.15. That buys the
+two-wheeler recall without buying the rooftop cars.
 
-1. The bias grows **~17x from the bottom of the frame to the top**, so it does not cancel
-   as a vehicle crosses the scene. A monotonically growing position error **is** a
-   velocity error.
-2. It is **orientation-dependent**, so a turning vehicle's box centre moves even when its
-   true footprint centre does not - spurious motion exactly where turning counts and
-   conflict detection are most sensitive.
-3. The conflict envelope for two cars is **2.07 m**. In the upper half of the frame the
-   roof-displacement scale is the same order as the whole envelope, which puts it squarely
-   in the way of the conflict work in #5/#6/#7.
+---
 
-**Fix.** `pipeline/contact_points.py`: prompt the MobileSAM weights *already* in the
-project with detection boxes, and take the tyre-contact line of the resulting instance
-mask. Contact row = **92nd percentile** of mask rows, not `max(v)`, because the dominant
-failure mode on sunlit aerial imagery is a cast shadow leaking the mask downward -
-`max(v)` follows the shadow tip an unbounded distance, a percentile bounds the error to
-the tail SAM actually mislabelled. `u` is the median of a 6 px band above that row; the
-band's p5/p95 give a true contact-line width, which also replaces the box-corner proxy
-behind `footprint_m` and the LGV/HGV split from #3.
+## 23. Segmentation was visible but was not filtering anything
 
-Three decisions worth recording:
+**Problem.** The road mask was drawn on the video, and yet cars were still being detected
+and tracked on a rooftop, in a private courtyard, and in vegetation.
 
-- **A second pass over `boxes.csv`, not a call inside the tracker.** Costs one extra video
-  decode, and in exchange `trajectories.csv` stays the single contract, an existing run
-  can be re-anchored with **no re-detection** (the payoff from #8, applied to
-  segmentation), and a SAM failure cannot destroy a finished detection run.
-- **Both anchors are kept.** `x, y` are never overwritten; `x_seg, y_seg` sit beside them
-  and one config key chooses which feeds the world coordinates. Without this the
-  "improvement" would be unfalsifiable - you cannot compare against a baseline you have
-  overwritten.
-- **Rejected frames interpolate the box->mask OFFSET, they do not revert.** Snapping one
-  rejected frame back to the box point would reintroduce a 0.1-1.8 m discontinuity
-  mid-track, and a discontinuity is exactly what a centred difference turns into a
-  phantom speed spike. Mixing anchors within one track is worse than using either
-  consistently.
+**Diagnosis.** The mask was being computed and displayed but `filter_detections` was
+`false`, so it was decoration. The reason it was left off was a genuine worry: an
+off-road detection may be a real road user on a footpath, so deleting detections by
+position risks deleting real data.
 
-**Falsifiable check, built in from the start.** The geometry predicts the measured shift
-grows monotonically from the bottom of the frame to the top and scales with object
-height. `contact_metrics` reports the shift per image-row band and per class, and the
-dashboard states plainly whether the prediction held - a flat profile means the estimator
-is wrong, not that the feature is fine. `path_quality` (speed jitter, footprint CV,
-straight-path RMS lateral deviation on raw coordinates) is computed on **every** run, so
-the bbox-vs-mask A/B is a diff of two `summary.json` files rather than bespoke tooling.
+The check that resolved the worry: for each track, what fraction of its life is on the
+carriageway? The distribution over all 292 tracks is **perfectly bimodal**:
 
-**Lesson.** The strongest version of "interrogate your own output" is to interrogate an
-input that never produced a visible error. This one was found by reading a comment, doing
-the trigonometry it implied, and discovering the quantity the whole system rests on
-corresponds to no physical feature of the object being measured.
+| on-road fraction | 0-10% | 10-25% | 25-50% | 50-75% | 75-90% | 90-100% |
+|---|---|---|---|---|---|---|
+| tracks | 38 | 0 | 0 | 0 | 0 | 254 |
+
+Nothing at all between 0.1 and 0.9. The threshold value is therefore irrelevant - there
+is nothing ambiguous to threshold. The four detections circled in the bug report all
+measure exactly 0.00.
+
+**Fix.** Filter **per track, not per observation.** A per-observation filter would delete
+the frames where a real vehicle clips a verge, splitting one track into fragments and
+destroying the ID stability Level 1 is actually scored on. A track is now kept or dropped
+as a whole: 34 tracks (8,313 observations) removed, and pedestrians are exempt because a
+footpath is legitimately off-carriageway.
+
+---
+
+## 24. Everything was classified as a car
+
+**Problem.** Trucks, buses and bikes were all labelled `car`. Level 2 asks for
+fine-grained vehicle classification, so this was the deliverable, not a cosmetic issue.
+
+**Diagnosis.** The first instinct was that per-track majority voting was flattening
+minority classes. That was wrong, and querying the raw votes rather than guessing is what
+showed it. Across 69,505 detections the model's own per-frame labels were:
+
+| car | truck | pedestrian | motorcycle | bus |
+|---|---|---|---|---|
+| 63,931 | 2,565 | 1,625 | 817 | 567 |
+
+**92% of every detection came back "car"**, and median per-track vote purity was **1.00**.
+The voting was innocent; the class head was confidently and consistently wrong. YOLO was
+trained on ground-level photographs where a bus is a tall slab of windows. From directly
+overhead it is a long rectangle, which is out of distribution, so the classifier collapses
+onto its dominant prior. No amount of temporal aggregation repairs a systematic error.
+
+**Fix.** Stop asking the network for the fine-grained answer and **measure the vehicle**,
+which telemetry calibration makes possible - and which is how traffic engineering has
+always classified vehicles (FHWA-style schemes use length and axle count, not appearance).
+
+The obstacle is that YOLO returns an **axis-aligned** box, so its width is not the
+vehicle's width - it is a mixture of length and width that depends on heading. Projecting
+two probes gives two equations in two unknowns:
+
+    footprint = L|cos phi| + W|sin phi|      (box bottom edge, on the road plane)
+    depth     = L|sin phi| + W|cos phi|      (box vertical extent, projected down)
+
+solved per observation, with the near-45-degree cases discarded because there the box is
+square and carries no orientation information (|cos 2phi| < 0.35), then taking the median
+per track. Measured size now overrides the model on **20% of tracks**:
+
+| | car | lgv | hgv | bus | motorcycle | pedestrian |
+|---|---|---|---|---|---|---|
+| model said | 231 | 18 | 3 | 2 | 9 | 29 |
+| measured | **182** | **55** | **15** | 2 | 9 | 29 |
+
+Each signal is used where it is strong. The **model keeps** pedestrians and two-wheelers:
+COCO is genuinely good on them from above, and size is weakest exactly there
+(motorcycle 1.92 m vs car 2.54 m is a 1.14x gap, against 1.87x for car vs truck).
+**Size owns** the car / LGV / HGV separation. Where size only says "large", bus vs HGV is a
+tie a tape measure cannot break, so the model breaks it and `class_source` records that.
+
+**What we do not claim.** Measured length is biased upwards by vehicle height - the box's
+far edge is projected onto the road plane, which for a tall vehicle lands beyond the real
+bodywork - so a real 4.4 m car measures ~2.5 m. These are consistent *relative* sizes, not
+catalogue dimensions. The bands are therefore calibrated against the distribution this
+footage produces rather than copied from a vehicle spec sheet, and every track carries the
+`length_m` / `width_m` that classified it.
+
+---
+
+## 25. Peak acceleration came out at 4.6 g
+
+**Problem.** The Level 2 kinematics export reported a peak acceleration of
+**45.25 m/s2** - about 4.6 g. No road vehicle does that.
+
+**Diagnosis.** Acceleration is a second derivative of position. The bottom edge of a
+bounding box jitters by a pixel or two between frames; at 0.0617 m/px and 30 fps, a
+single-pixel wobble differentiates into tens of m/s2. The per-track **maximum** is
+therefore a measurement of the worst frame of tracking noise, not of any manoeuvre - the
+same failure mode that made raw top speed unusable earlier (issue 12).
+
+**Fix.** Report **p95 / p5 per track** as the headline and keep the raw extremes in
+`kinematics.csv` for audit only. Per-class figures land at 0.3-2.0 m/s2, and
+**motorcycles come out highest** - an independent sanity signal we did not tune for, since
+bikes really do accelerate hardest. Fleet extremes are then -8.5 / +8.0 m/s2, which is the
+right magnitude for emergency braking.
+
+Two further guards, because a percentile is not a proof: any track whose acceleration
+exceeds a 10 m/s2 physical envelope is **flagged, not silently clipped** (26 of 292), and
+the fleet extremes are computed over the 266 unflagged tracks - on a very short track p5
+is nearly the raw minimum, so a spike survives the percentile and would set the fleet
+record on its own.
+
+The same run exposed a smaller reporting error: mean speed was NaN for every parked
+vehicle, because averaging over "moving" observations is undefined when a vehicle never
+moved. Both are now reported - `mean_speed_kph` (journey speed, including time stopped at
+the signal) and `mean_moving_speed_kph` (cruise speed) - because they answer different
+questions and collapsing them hides the queueing.
+
+## 26. The dashboard opened on the wrong run
+
+**Symptom.** After a new pipeline run finished, opening the dashboard still showed
+the previous run's numbers. Nothing looked broken - the figures were internally
+consistent, just stale.
+
+**Cause.** The run selector listed tags from `glob`, which returns them in
+filesystem order. `annotated.mp4` (the very first run) sorted ahead of `_v4`, so
+the default selection was the oldest run in the folder.
+
+**Why it mattered more than it looks.** This is the failure mode that loses a demo.
+Every number on screen is real and self-consistent, so there is no visual cue that
+you are presenting three-hour-old results.
+
+**Fix.** Order runs by the summary JSON's modification time, newest first, so the
+dashboard always opens on the most recent run.
+
+---
+
+## 27. Merging the two per-vehicle tables silently corrupted the columns
+
+**Symptom.** Building the vehicle register from `track_summary` + `kinematics`
+produced columns named `mean_speed_kph_x` and `mean_speed_kph_y`, and the display
+column list matched neither, so the speed columns silently disappeared from the
+table.
+
+**Cause.** Both exports legitimately carry `class`, `n_obs`, `length_m`, `width_m`
+and `mean_speed_kph` - they were designed to each stand alone as an artifact. A
+plain merge on `track_id` therefore collides on five columns and pandas suffixes
+them rather than failing.
+
+**Fix.** Drop the duplicated columns from the right-hand table before merging, so
+the register keeps one authoritative copy of each. The two CSVs on disk stay
+self-contained, which was the point of exporting them separately.
+
+**Related, same root cause.** The "notable vehicles" helper in the interpretation
+brief sorts a table by a column and then selects a keep-list that already contains
+that column, producing a duplicate that made `to_json(orient="records")` raise
+`DataFrame columns must be unique`. Fixed with `dict.fromkeys` to de-duplicate
+while preserving order.
+
+---
+
+## 28. The LLM call would have sent the API key to a third party, invisibly
+
+**Symptom.** Testing the interpretation call with a deliberately invalid key
+returned a 401 whose body was neither Anthropic's error format nor Anthropic's
+wording:
+
+```
+Error code: 401 - {'error': {'message': '?????', 'type': 'new_api_error'}}
+```
+
+The request id and error type did not match the Anthropic API at all.
+
+**Cause.** This machine has `ANTHROPIC_BASE_URL=https://agentrouter.org` set in the
+environment, and the Anthropic SDK honours that variable automatically. So
+`anthropic.Anthropic(api_key=key)` - the obvious one-line constructor - quietly
+routes both the API key and the request body to a third-party proxy, with nothing
+in the code or on screen indicating it.
+
+**Why this is a real issue and not a curiosity.** The dashboard asks the user to
+paste an API key into a text box. Sending that credential somewhere the user did
+not choose is a credential-disclosure bug, and the evidence brief goes with it.
+The failure is silent by construction: if the proxy works, everything looks fine.
+
+**Fix.** The endpoint is now resolved explicitly rather than inherited:
+
+- `resolve_endpoint()` returns the base URL that will actually be used.
+- The sidebar displays it, and warns when it is not `api.anthropic.com`, with a
+  checkbox to force the real endpoint.
+- The CLI prints the same warning and takes `--base-url`.
+- The key is session-scoped: never written to disk, never logged, never committed.
+
+**Transferable lesson.** A convenience default that reads from the environment is a
+supply-chain surface. Any SDK constructor that can silently retarget where
+credentials go should have its destination pinned and displayed.
+
+---
+
+## 29. The smallest size band absorbs anything smaller than a car
+
+**Symptom.** The fastest vehicle in the run, track #1080 at an estimated 47.9 km/h,
+is classified `car` but measures 1.44 m x 0.66 m - two-wheeler proportions, roughly
+half the measured length of the class median car (1.90 m).
+
+**Cause.** The size bands are open at the bottom: `< 3.0 m -> car`. There is no
+floor beneath the car band, so any motor vehicle the detector did not already call a
+motorcycle falls into `car` regardless of how small it measures. Two-wheelers are
+deliberately model-owned (issue 24) precisely because size discriminates them
+poorly - but that decision left the size path with no way to express "too small to
+be a car".
+
+**Status: open, documented, not fixed.** The honest fix is a lower band plus a
+disagreement rule (size says two-wheeler, model says car -> flag rather than
+silently pick one), which is a classification change, not a display change. It is
+recorded here rather than patched quietly because the count of cars is very slightly
+overstated and the count of two-wheelers understated, and anyone quoting those two
+numbers should know it.
+
+**How it was found.** By reading the interpretation brief's own "fastest vehicles"
+shortlist and noticing that the class label and the measured dimensions on the same
+row disagreed. The brief was built to let a language model cross-check the numbers;
+the first thing it did was catch us.
+
+---
 
 ---
 
 ## The pattern behind all of these
 
-Six of the seventeen issues above (4, 5, 6, 7, 9, 11) were found by **interrogating
-our own output** - looking at distributions, cross-tabulating by category, and
-asking whether a number was physically plausible - not by seeing a crash. Issue 17
-goes one step further: it was found by interrogating an *input* that never produced a
-visible error at all.
+Eighteen of the twenty-nine issues above (4, 5, 6, 7, 9, 11, 17, 18, 19, 21, 22,
+23, 24, 25, 26, 27, 28, 29) were found by
+**interrogating our own output** - looking at distributions, cross-tabulating by
+category, and asking whether a number was physically plausible - not by seeing a
+crash.
 
 The conflict detector is the clearest example. It never threw an error. It produced
 confident, well-formatted, plausible-looking output at every stage, and it was
@@ -447,3 +769,30 @@ wrong three times in a row for three completely different reasons: speed noise
 normal oncoming traffic look like head-on collisions (issue 7). Each one was only
 findable by asking "is this number actually believable?" and then checking a
 distribution instead of trusting the answer.
+
+The segmentation work repeated the pattern in miniature, twice in a row and in
+opposite directions - SAM segmenting cars instead of road (17), then swallowing a
+rooftop (18) - and both were caught by a single measured number, the overlap between
+what SAM proposed and where traffic demonstrably drove.
+
+And issue 19 is the same discipline applied *before* believing good news: the setting
+with the largest improvement in detection count is the one we rejected.
+
+Issues 22, 24 and 25 are the same discipline again, and each one punished a different
+kind of guess. In 22 the *intuitive* fix - upscale the frame - was measured and rejected,
+because it improved the number we were watching while making the actual goal worse. In 24
+the *plausible* diagnosis - majority voting flattens minority classes - was checked
+against the raw votes and turned out to be innocent, which redirected the fix from the
+aggregation layer to the classifier itself. And 25 never crashed, never looked broken, and
+produced a tidy CSV full of numbers; it was caught by one question - is 4.6 g believable? -
+which is the only question that separates a measurement from a plausible-looking float.
+
+Issues 26 to 29 came from the last hour, and three of them are the same lesson in a
+new costume. 26 and 27 are silent-wrong-output bugs: a stale run and a corrupted
+merge both produce a screen full of plausible, self-consistent numbers, which is
+strictly more dangerous than a traceback. 28 is that same silence applied to a
+credential - an SDK reading an environment variable we did not set, in a direction we
+did not choose. And 29 we did not fix: the brief we built so that a language model
+could cross-check our measurements immediately surfaced a row where our own class
+label and our own measured dimensions contradicted each other, and the correct
+response to that is to write it down, not to bury it.

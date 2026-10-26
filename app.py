@@ -13,15 +13,46 @@ import glob
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
-OUT_DIR = "outputs"
+import yaml
 
 st.set_page_config(page_title="Drone Traffic Intelligence", page_icon="::", layout="wide")
+
+from pipeline import interpret as interp
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AERIAL_CHECKPOINT = os.path.join(BASE_DIR, "models", "best.pt")
+
+
+def _session_isolation_enabled() -> bool:
+    value = os.environ.get("ISOLATE_SESSION_OUTPUTS", "")
+    try:
+        value = value or st.secrets.get("ISOLATE_SESSION_OUTPUTS", "")
+    except Exception:
+        # No local Streamlit secrets file is normal during development.
+        pass
+    return str(value).lower() in {"1", "true", "yes"}
+
+# A shared public deployment must not expose one visitor's uploaded footage or
+# results in another visitor's run selector. Local development keeps using the
+# repository's outputs/ directory; hosted deployments can isolate files by
+# Streamlit session and use ephemeral container storage.
+if _session_isolation_enabled():
+    _session_id = st.session_state.setdefault("_output_session_id", uuid.uuid4().hex)
+    OUT_DIR = os.path.join(tempfile.gettempdir(), "drone_traffic_sessions", _session_id)
+else:
+    OUT_DIR = os.path.join(BASE_DIR, "outputs")
 
 # Dark operations-console styling; the video and charts carry the colour.
 st.markdown(
@@ -54,37 +85,135 @@ SEV_COLOR = {"high": "#ff4d5a", "medium": "#ffa03c", "low": "#7d8794"}
 
 # --------------------------------------------------------------------------- io
 def available_tags() -> list[str]:
-    """Discover pipeline runs by looking for summary JSONs."""
-    tags = []
+    """
+    Discover pipeline runs by looking for summary JSONs, newest first.
+
+    Ordered by write time so the dashboard opens on the most recent run rather
+    than on whichever tag happens to sort first - a stale default is the fastest
+    way to demo the wrong numbers.
+    """
+    found = []
     for p in glob.glob(os.path.join(OUT_DIR, "summary*.json")):
         base = os.path.basename(p)[len("summary"):-len(".json")]
-        tags.append(base.lstrip("_"))
-    return sorted(tags, key=lambda t: (t != "", t))
+        found.append((os.path.getmtime(p), base.lstrip("_")))
+    return [t for _, t in sorted(found, reverse=True)]
 
 
 def suffixed(name: str, ext: str, tag: str) -> str:
     return os.path.join(OUT_DIR, f"{name}{'_' + tag if tag else ''}{ext}")
 
 
-def video_versions(tag: str) -> list[str]:
+def latest_video(name: str, tag: str) -> str | None:
     """
-    Every render for this run, oldest first.
+    Newest render of a video, honouring the `_vN` versioning.
 
-    `run_pipeline.next_video_path` never clobbers a render - it writes
-    annotated.mp4, then annotated_v2.mp4, and so on - so looking only at the base
-    name shows a STALE video. That matters directly for the contact-point work:
-    after re-rendering with the mask anchor, the base file is still the old
-    bbox-anchored render.
+    Renders are never overwritten, so a run directory accumulates annotated.mp4,
+    annotated_v2.mp4, ... The dashboard should always show the most recent one.
     """
-    base = suffixed("annotated", ".mp4", tag)
-    root, ext = os.path.splitext(base)
-    found = [base] if os.path.exists(base) else []
-    versioned = []
-    for p in glob.glob(f"{root}_v*{ext}"):
-        m = re.search(r"_v(\d+)" + re.escape(ext) + r"$", os.path.basename(p))
-        if m:
-            versioned.append((int(m.group(1)), p))
-    return found + [p for _, p in sorted(versioned)]
+    base = suffixed(name, ".mp4", tag)
+    root = base[:-4]
+    cands = [base] + glob.glob(f"{root}_v*.mp4")
+    cands = [c for c in cands if os.path.exists(c)]
+    if not cands:
+        return None
+    return max(cands, key=os.path.getmtime)
+
+
+def playable_video(name: str, tag: str) -> tuple[str | None, str | None]:
+    """
+    Pick the file a browser can actually decode, and report the newest raw render.
+
+    OpenCV's writer produces mp4v/mpeg4, which no browser will play - the player
+    renders but sits at 0:00. Every render therefore gets an H.264 sibling named
+    `<render>_web.mp4`, and that is what must be handed to st.video().
+
+    The naming is `annotated_<tag>[_vN][_web].mp4`, so the web transcode of run v4
+    is `annotated_v4_web.mp4`. Asking suffixed() for "annotated_web" instead builds
+    `annotated_web_v4.mp4`, which does not exist - the lookup silently missed, fell
+    back to the raw mpeg4 render, and the video appeared blank.
+
+    Returns (file_to_play, newest_raw_render) so the caller can say when the newest
+    render has no transcode yet.
+    """
+    base = suffixed(name, ".mp4", tag)
+    root = base[:-4]
+    family = [base, f"{root}_web.mp4"]
+    family += glob.glob(f"{root}_v[0-9]*.mp4") + glob.glob(f"{root}_v[0-9]*_web.mp4")
+    family = [c for c in dict.fromkeys(family) if os.path.exists(c)]
+
+    # `_vN` is overloaded: it marks a re-render of one run (annotated_v3.mp4) AND it
+    # is used as a run tag (annotated_v4.mp4). Filename alone cannot tell them apart,
+    # so a run that has its own summary JSON owns its files - otherwise the default
+    # run would show v4's video, which is the wrong footage under the right heading.
+    known = {t for t in available_tags() if t}
+    def _own(path: str) -> bool:
+        rel = os.path.basename(path)[len(os.path.basename(root)):]
+        rel = rel[:-len(".mp4")].removesuffix("_web").lstrip("_")
+        return not rel or rel.split("_")[0] not in known
+    family = [c for c in family if _own(c)]
+    if not family:
+        return None, None
+
+    raws = [c for c in family if not c.endswith("_web.mp4")]
+    webs = [c for c in family if c.endswith("_web.mp4")]
+    newest_raw = max(raws, key=os.path.getmtime) if raws else None
+
+    # The transcode of the newest render is the ideal; otherwise the newest
+    # transcode of any render still beats an unplayable file.
+    if newest_raw:
+        sibling = newest_raw[:-4] + "_web.mp4"
+        if os.path.exists(sibling):
+            return sibling, newest_raw
+    if webs:
+        return max(webs, key=os.path.getmtime), newest_raw
+    return newest_raw, newest_raw
+
+
+def ffmpeg_executable() -> str | None:
+    """Find system FFmpeg, or use the binary bundled with imageio-ffmpeg."""
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError):
+        return None
+
+
+@st.cache_resource(show_spinner="Checking the aerial detector (first launch may take a minute)...")
+def ensure_aerial_model() -> tuple[bool, str]:
+    """Download and verify the pinned model once when a deployment lacks it."""
+    if os.path.isfile(AERIAL_CHECKPOINT):
+        return True, ""
+    try:
+        result = subprocess.run(
+            [sys.executable, os.path.join(BASE_DIR, "tools", "download_aerial_model.py")],
+            cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=600,
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "Model setup failed.").strip()
+        return False, detail[-3000:]
+    return os.path.isfile(AERIAL_CHECKPOINT), result.stdout.strip()
+
+
+def transcode_for_browser(source: str) -> tuple[str | None, str | None]:
+    """Create a browser-compatible H.264 copy without changing the raw render."""
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        return None, "FFmpeg is unavailable. Install requirements.txt or system FFmpeg."
+    target = source[:-4] + "_web.mp4"
+    result = subprocess.run(
+        [ffmpeg, "-y", "-i", source, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-crf", "28", "-movflags", "+faststart", target],
+        cwd=BASE_DIR, capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not os.path.exists(target):
+        return None, result.stderr[-1200:] or "FFmpeg did not create the browser video."
+    return target, None
 
 
 @st.cache_data(show_spinner=False)
@@ -106,21 +235,192 @@ def load_json(path: str) -> dict:
 
 
 # ------------------------------------------------------------------ load a run
+st.title("Drone Traffic Intelligence")
+st.caption("Upload an aerial traffic video to detect, track, and analyze road users.")
+
+model_ready, model_setup_detail = ensure_aerial_model()
+if not model_ready:
+    st.error("The aerial detector could not be installed, so video analysis is unavailable.")
+    if model_setup_detail:
+        with st.expander("Model setup details"):
+            st.code(model_setup_detail, language="text")
+
+with st.expander("Project overview · tech stack · what I learned"):
+    st.markdown(
+        "**A computer vision learning project** that turns aerial traffic video into "
+        "road-user detections, persistent tracks, trajectories, and traffic summaries. "
+        "It is an analytical prototype, not a certified traffic-safety system."
+    )
+    overview_col, learning_col = st.columns(2, gap="large")
+    with overview_col:
+        st.markdown("**Tech stack**")
+        st.markdown(
+            "- **Python** — pipeline and data processing\n"
+            "- **PyTorch + Ultralytics YOLOv8n** — aerial road-user detection\n"
+            "- **ByteTrack** — tracking detections across frames\n"
+            "- **OpenCV + FFmpeg** — video/frame handling and browser-compatible output\n"
+            "- **NumPy, Pandas, SciPy** — trajectories and analytics\n"
+            "- **Streamlit + Plotly** — interactive dashboard and charts\n"
+            "- **DJI SRT telemetry (optional)** — camera/altitude data for ground-plane estimates"
+        )
+    with learning_col:
+        st.markdown("**What I learned**")
+        st.markdown(
+            "- How object detection differs from multi-object tracking\n"
+            "- Why stable IDs, occlusion handling, and frame sampling affect results\n"
+            "- How to turn detections into trajectories and derive traffic measures\n"
+            "- How camera geometry and telemetry affect pixel-to-metre estimates\n"
+            "- How to expose uncertainty and validate a vision pipeline instead of "
+            "treating every model output as ground truth"
+        )
+
+with st.expander("Upload a video and run analysis", expanded=not bool(available_tags())):
+    st.markdown(
+        "Choose a video to run the detection and tracking pipeline. DJI telemetry is "
+        "optional; without a matching subtitle file, motion is reported in pixel-space. "
+        "Processing time depends on video length and available hardware."
+    )
+    with st.form("upload_run_form"):
+        uploaded_video = st.file_uploader(
+            "Traffic video", type=["mp4", "mov", "m4v", "avi", "mkv"],
+            help="Use an aerial traffic clip. Large or long videos may take a while to process.",
+        )
+        uploaded_srt = st.file_uploader(
+            "Matching DJI telemetry subtitles (optional)", type=["srt"],
+            help="Only attach a subtitle file recorded for this exact video. Enables metric estimates.",
+        )
+        clip_start = st.number_input(
+            "Clip start time in the original DJI recording (seconds)",
+            min_value=0.0, value=0.0, step=1.0,
+            help="Use 0 when the subtitle file starts with the uploaded clip.",
+        ) if uploaded_srt else 0.0
+        stride = st.select_slider(
+            "Process every Nth frame", options=[1, 2, 3, 5], value=3,
+            help="Higher values are faster but may miss brief events and small objects.",
+        )
+        use_segmentation = st.checkbox(
+            "Use the single-frame road mask", value=False,
+            help="Enable only for a fixed or hovering camera. Moving cameras need frame-by-frame stabilization.",
+        )
+        # Keep this enabled: controls inside a Streamlit form do not trigger a
+        # rerun as files are selected, so a disabled expression here can remain
+        # stuck at its initial (no upload) state.
+        start_run = st.form_submit_button(
+            "Analyze video", type="primary", disabled=not model_ready
+        )
+
+    if start_run and uploaded_video is None:
+        st.error("Choose a traffic video before starting the analysis.")
+    elif start_run:
+        ext = Path(uploaded_video.name).suffix.lower()
+        if ext not in {".mp4", ".mov", ".m4v", ".avi", ".mkv"}:
+            st.error("Unsupported video format.")
+        else:
+            tag = "upload_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+            uploads_dir = os.path.join(OUT_DIR, "uploads")
+            configs_dir = os.path.join(OUT_DIR, "upload_configs")
+            os.makedirs(uploads_dir, exist_ok=True)
+            os.makedirs(configs_dir, exist_ok=True)
+            video_path = os.path.join(uploads_dir, tag + ext)
+            with open(video_path, "wb") as video_file:
+                video_file.write(uploaded_video.getbuffer())
+
+            config_path = os.path.join(configs_dir, tag + ".yaml")
+            with open(os.path.join(BASE_DIR, "config", "config.yaml"), "r", encoding="utf-8") as config_file:
+                run_config = yaml.safe_load(config_file)
+            run_config["video"]["path"] = video_path
+            run_config["video"]["clip_start_s"] = float(clip_start)
+            run_config["video"]["frame_stride"] = int(stride)
+            run_config["telemetry"]["srt_path"] = None
+            run_config["segmentation"]["enabled"] = bool(use_segmentation)
+            run_config["output"]["dir"] = OUT_DIR
+            # Uploaded footage is aerial: require and explicitly record the
+            # VisDrone checkpoint rather than silently falling back to COCO.
+            run_config["detector"].update({
+                "weights": "models/best.pt",
+                "classes": list(range(10)),
+                "imgsz": 1280,
+                "conf": 0.10,
+                "strict_conf": 0.20,
+                "small_conf": 0.08,
+            })
+            with open(config_path, "w", encoding="utf-8") as config_file:
+                yaml.safe_dump(run_config, config_file, sort_keys=False)
+            srt_path = None
+            if uploaded_srt is not None:
+                srt_path = os.path.join(uploads_dir, tag + ".srt")
+                with open(srt_path, "wb") as srt_file:
+                    srt_file.write(uploaded_srt.getbuffer())
+
+            command = [sys.executable, "-u", "run_pipeline.py", "--config", config_path,
+                       "--video", video_path, "--stride", str(stride), "--tag", tag]
+            if srt_path:
+                command.extend(["--srt", srt_path])
+            log_box = st.empty()
+            progress = st.progress(0, text="Starting analysis…")
+            log_lines = []
+            try:
+                process = subprocess.Popen(
+                    command, cwd=BASE_DIR, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                    bufsize=1,
+                )
+                for line in process.stdout:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    log_lines.append(line)
+                    log_lines = log_lines[-12:]
+                    frame_match = re.search(r"(\d+) frames\s+([\d.]+) fps", line)
+                    if frame_match:
+                        progress.progress(35, text=f"Detection and tracking: {frame_match.group(1)} frames")
+                    elif "[3/6]" in line or "[3b/6]" in line:
+                        progress.progress(55, text="Building trajectories and road mask…")
+                    elif "[4/6]" in line:
+                        progress.progress(70, text="Calculating traffic analytics…")
+                    elif "[5/6]" in line:
+                        progress.progress(82, text="Rendering trajectory map…")
+                    elif "[6/6]" in line:
+                        progress.progress(90, text="Rendering annotated video…")
+                    log_box.code("\n".join(log_lines), language="text")
+                return_code = process.wait()
+            except Exception as exc:
+                st.error(f"Could not start analysis: {exc}")
+                return_code = -1
+
+            if return_code == 0:
+                progress.progress(100, text="Analysis complete")
+                video_out = os.path.join(OUT_DIR, f"annotated_{tag}.mp4")
+                if os.path.exists(video_out):
+                    _, transcode_error = transcode_for_browser(video_out)
+                    if transcode_error:
+                        st.warning("Analysis finished, but browser video conversion failed. "
+                                   "The CSV and summary outputs are available. " + transcode_error)
+                st.success("Analysis complete. Opening the new run…")
+                st.cache_data.clear()
+                st.session_state["selected_run_tag"] = tag
+                st.rerun()
+            else:
+                progress.empty()
+                st.error("Analysis failed. The pipeline output above should show the cause.")
+
 tags = available_tags()
 if not tags:
-    st.title("Drone Traffic Intelligence")
-    st.error("No pipeline output found. Run the pipeline first:")
-    st.code("python run_pipeline.py", language="bash")
+    st.info("Upload a video above to create your first analysis run.")
     st.stop()
 
 with st.sidebar:
     st.markdown("### Run")
-    tag = st.selectbox("pipeline output", tags, format_func=lambda t: t or "(default)")
+    default_tag = st.session_state.pop("selected_run_tag", tags[0])
+    selected_index = tags.index(default_tag) if default_tag in tags else 0
+    tag = st.selectbox("pipeline output", tags, index=selected_index,
+                       format_func=lambda t: t or "(default)")
 
 summary = load_json(suffixed("summary", ".json", tag))
 obs = load_csv(suffixed("trajectories", ".csv", tag))
 events = load_csv(suffixed("events", ".csv", tag))
 tracks = load_csv(suffixed("track_summary", ".csv", tag))
+boxes = load_csv(suffixed("boxes", ".csv", tag))
 queues = load_csv(suffixed("queues", ".csv", tag))
 congestion = load_csv(suffixed("congestion", ".csv", tag))
 active = load_csv(suffixed("active_tracks", ".csv", tag))
@@ -128,11 +428,27 @@ turns = load_csv(suffixed("turning_movements", ".csv", tag))
 flow = load_csv(suffixed("directional_flow", ".csv", tag))
 inter = load_csv(suffixed("interactions", ".csv", tag))
 headways = load_csv(suffixed("headways", ".csv", tag))
+kin = load_csv(suffixed("kinematics", ".csv", tag))
 
 calib = summary.get("calibration", {})
 calibrated = bool(calib.get("usable"))
+if not calibrated:
+    # Older runs may have pixel-space pairs graded by the previous pseudo-metric
+    # logic. Keep their CSVs intact, but don't present those rows as safety events.
+    unsupported_events = {
+        "potential_conflict", "close_interaction", "near_miss_proximity"
+    }
+    if not events.empty and "event_type" in events:
+        events = events[~events["event_type"].isin(unsupported_events)].copy()
 counts = summary.get("counts", {})
 speed = summary.get("speed", {})
+
+with st.sidebar:
+    # The API key is intentionally not exposed in the UI. AI interpretation is
+    # optional and only available when configured by the operator in the environment.
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    llm_model = interp.MODEL
+    endpoint = interp.resolve_endpoint()
 
 # ------------------------------------------------------------------- sidebar
 with st.sidebar:
@@ -178,8 +494,50 @@ with st.sidebar:
         f"({v.get('processing_fps')} fps processing)"
     )
 
+    seg = summary.get("road_segmentation", {}) or {}
+    if seg.get("enabled"):
+        st.markdown("### Road segmentation")
+        area_frac = seg.get("road_area_frac", seg.get("travelled_area_frac"))
+        st.metric("Carriageway", f"{area_frac:.1%} of frame" if area_frac else "-")
+        if seg.get("road_area_m2"):
+            st.caption(f"{seg['road_area_m2']:,.0f} m2 of road (via the ground projection)")
+        st.caption(f"source: `{seg.get('source')}`")
+        agree = seg.get("agreement") or {}
+        if agree:
+            st.caption(
+                "**Two independent estimates, cross-checked**\n\n"
+                f"MobileSAM vs observed traffic: IoU {agree.get('iou')}, "
+                f"SAM covers {agree.get('sam_covers_travelled_frac', 0):.0%} of the "
+                "area traffic demonstrably used."
+            )
+        vet = seg.get("segment_vetting") or {}
+        if vet:
+            st.caption(
+                f"SAM proposed, traffic vouched: **{vet.get('accepted')} accepted, "
+                f"{vet.get('rejected')} rejected**. SAM is class-agnostic, so "
+                "unvetted it contributed a rooftop and a tree canopy."
+            )
+        filt = seg.get("filter") or {}
+        if filt.get("applied"):
+            st.caption(
+                f"off-road filter dropped {filt.get('observations_dropped')} of "
+                f"{filt.get('observations_before')} observations"
+            )
+        else:
+            st.caption(
+                "Off-road detections are dimmed in the video but **kept** in the "
+                "analytics - a detection on a verge may be a real road user."
+            )
+
 # --------------------------------------------------------------------- header
-st.title("Drone Traffic Intelligence")
+run_meta = summary.get("run", {})
+if run_meta:
+    st.caption(f"Run `{run_meta.get('tag', tag or 'default')}` · "
+               f"created {run_meta.get('created_utc', 'unknown')} · "
+               f"effective config SHA-256 `"
+               f"{run_meta.get('effective_config_sha256', run_meta.get('config_sha256', 'unavailable'))[:12]}`")
+elif tag:
+    st.caption(f"Saved run `{tag}` · legacy run metadata unavailable")
 st.caption(
     "Trajectory-first traffic analytics - every insight below is derived from tracked "
     "road-user trajectories, not from isolated frame detections."
@@ -198,8 +556,12 @@ if calibrated and speed.get("mean_moving_speed") is not None:
 else:
     k[4].metric("Mean speed", f"{speed.get('mean_moving_speed', '-')} px/s",
                 help="No metric calibration, so km/h is not reported.")
-n_conf = int(summary.get("interactions", {}).get("potential_conflicts", 0))
-k[5].metric("Potential conflicts", n_conf)
+if calibrated:
+    n_conf = int(summary.get("interactions", {}).get("potential_conflicts") or 0)
+    k[5].metric("Potential conflicts", n_conf)
+else:
+    k[5].metric("Potential conflicts", "Unavailable",
+                help="Metric calibration is required for physical conflict grading.")
 
 cong_levels = summary.get("congestion", {}).get("levels", {})
 if cong_levels:
@@ -216,51 +578,61 @@ if cong_levels:
 
 st.divider()
 
-# ------------------------------------------------------- video (Full Width for maximum visibility)
-st.subheader("Annotated aerial view")
-versions = video_versions(tag)
-vid = versions[-1] if versions else suffixed("annotated", ".mp4", tag)
-if len(versions) > 1:
-    vid = st.selectbox(
-        "render version", list(reversed(versions)), index=0,
-        format_func=lambda p: os.path.basename(p) + (
-            "  (latest)" if p == versions[-1] else ""),
-        help="Renders are never overwritten, so earlier versions stay on disk "
-             "for side-by-side comparison.",
-    )
-root, ext = os.path.splitext(vid)
-web = f"{root}_web{ext}"
-playable = web if os.path.exists(web) else vid
-if os.path.exists(playable):
-    st.video(playable)
-    overlay_note = ""
-    cr = summary.get("contact_refinement", {})
-    if cr.get("enabled") and cr.get("masks_accepted"):
-        overlay_note = (
-            " The cyan bar under each vehicle is the MobileSAM tyre-contact line and "
-            "the short white stub is the correction away from the box bottom-centre; "
-            "trails follow the contact point, so the picture matches the numbers."
+# ------------------------------------------------------- video + traffic summary
+left, right = st.columns([1.65, 1], gap="large")
+
+with left:
+    st.subheader("Annotated aerial view")
+    legacy_conflicts = summary.get("interactions", {}).get("potential_conflicts")
+    if not calibrated and legacy_conflicts:
+        st.warning("This is a legacy uncalibrated run. Its saved video may contain pixel-space "
+                   "conflict labels that are no longer considered valid; reprocess the clip "
+                   "to generate a clean render.")
+    playable, newest_raw = playable_video("annotated", tag)
+    browser_copy = newest_raw[:-4] + "_web.mp4" if newest_raw else None
+    if newest_raw and not os.path.exists(browser_copy):
+        st.info("The annotated video is ready. It needs a browser-compatible copy before it can play here.")
+        if ffmpeg_executable():
+            if st.button("Prepare video for playback", key=f"transcode_{tag}", type="primary"):
+                with st.spinner("Converting the rendered video for browser playback…"):
+                    converted, error = transcode_for_browser(newest_raw)
+                if error:
+                    st.error(f"Video conversion failed: {error}")
+                else:
+                    st.success("Video is ready to play.")
+                    st.rerun()
+        else:
+            st.warning("Video conversion support is missing. Install the project requirements, then refresh this page.")
+    elif playable and os.path.exists(playable):
+        st.video(playable)
+        st.markdown(
+            "<div class='caveat'>Bounding box, class, track ID, live speed and trajectory "
+            "trail per road user. The trail is drawn from first detection to exit, so ID "
+            "continuity is visible end to end. Off-carriageway area is dimmed. Flagged "
+            "objects switch to red/orange; potential conflicts are drawn as a line "
+            "between the two interacting users.</div>",
+            unsafe_allow_html=True,
         )
-    st.markdown(
-        "<div class='caveat'>Bounding box, class, track ID, live speed and trajectory "
-        "trail per road user. Flagged objects switch to red/orange; potential conflicts "
-        f"are drawn as a line between the two interacting users.{overlay_note}</div>",
-        unsafe_allow_html=True,
-    )
-    if not os.path.exists(web):
-        st.caption(
-            "If the player shows nothing, the file is mp4v-encoded. Re-encode to H.264:"
-        )
-        st.code(f"ffmpeg -i {vid} -vcodec libx264 -crf 28 -y {web}", language="bash")
-else:
-    st.info("No annotated video for this run.")
+        mb = os.path.getsize(playable) / 1e6
+        st.caption(f"showing `{os.path.basename(playable)}` ({mb:.0f} MB)")
+    else:
+        st.info("No annotated video for this run.")
 
-st.divider()
+    mask_png = suffixed("road_mask", ".png", tag)
+    if os.path.exists(mask_png):
+        with st.expander("Road segmentation - the drivable-area mask", expanded=False):
+            st.image(mask_png, use_container_width=True)
+            st.markdown(
+                "<div class='caveat'>Computed <b>once</b> per clip, because the aircraft "
+                "hovers. Two independent estimates are combined: MobileSAM segments the "
+                "frame, and every observed trajectory point is rasterised to show where "
+                "traffic demonstrably drove. SAM proposes, the observed traffic vouches - "
+                "a segment is only accepted if it overlaps the travelled area, which is "
+                "what stops a grey rooftop being called road.</div>",
+                unsafe_allow_html=True,
+            )
 
-# ------------------------------------------------------- traffic summary & stats
-c_left, c_right = st.columns([1, 1], gap="large")
-
-with c_left:
+with right:
     st.subheader("Traffic composition")
     by_class = counts.get("by_class", {})
     if by_class:
@@ -277,7 +649,29 @@ with c_left:
         fig.update_traces(textposition="outside", cliponaxis=False)
         st.plotly_chart(fig, use_container_width=True)
 
-        if calibrated and not tracks.empty and "class_source" in tracks:
+        # How the classes were actually decided. Read from the run's own report so
+        # this text can never drift from what the pipeline did.
+        creport = summary.get("classification", {})
+        if creport and calibrated:
+            over = creport.get("size_overrode_model", 0)
+            pct = creport.get("size_overrode_model_pct", 0)
+            flow_txt = "; ".join(creport.get("override_flow", [])[:4])
+            st.markdown(
+                f"<div class='caveat'><b>How these classes were decided:</b> the aerial detector "
+                f"provides the initial class; calibrated size may refine it when the geometry is "
+                f"usable. Size overrode the model on <b>{over} of {creport.get('tracks', 0)} "
+                f"road users ({pct}%)</b> - {flow_txt}. {creport.get('caveat', '')} Each vehicle's deciding signal is "
+                f"recorded per-row in <code>class_source</code>.</div>",
+                unsafe_allow_html=True,
+            )
+        elif creport and not calibrated:
+            st.markdown(
+                "<div class='caveat'><b>Class labels:</b> shown from the aerial detector. "
+                "Without metric calibration, size-based class refinement is not applied. "
+                "Review confidence and raw labels in the downloadable boxes CSV.</div>",
+                unsafe_allow_html=True,
+            )
+        elif calibrated and not tracks.empty and "class_source" in tracks:
             n_heur = int((tracks["class_source"] == "size_heuristic_from_calibration").sum())
             if n_heur:
                 st.markdown(
@@ -290,7 +684,6 @@ with c_left:
                     unsafe_allow_html=True,
                 )
 
-with c_right:
     st.subheader("Identity stability")
     stab = summary.get("id_stability", {})
     if stab:
@@ -363,143 +756,160 @@ else:
 
 st.divider()
 
-# ------------------------------------------------- contact-point refinement
-st.subheader("Trajectory anchor: bounding box vs MobileSAM contact point")
-cr = summary.get("contact_refinement", {})
-pq = summary.get("path_quality", {})
-
-st.markdown(
-    "<div class='caveat'>The gimbal sits at <b>-63&deg; pitch, not nadir</b>, so the frame "
-    "spans 4&deg; off-nadir at the bottom edge to 50&deg; at the top. An elevated point "
-    "projects displaced radially by <code>height &times; tan(off-nadir)</code> - 0.11 m for a "
-    "car at the bottom of the frame, 1.78 m at the top, 3.80 m for a bus. A bounding box "
-    "wraps the whole silhouette <b>including the roof</b>, so its bottom edge is the wheel "
-    "line while its horizontal centre is roof-contaminated: the anchor belongs to no physical "
-    "feature of the vehicle, and because the bias grows ~17&times; up the frame it does not "
-    "cancel - it injects false velocity. A MobileSAM instance mask gives the real tyre-contact "
-    "line instead.</div>",
-    unsafe_allow_html=True,
+# ------------------------------------------------------------- vehicle register
+st.subheader("Vehicle register")
+st.caption(
+    "Every road user the pipeline tracked, with the measurement that classified it. "
+    "One row per identity, not per detection."
 )
 
-if not cr.get("enabled"):
-    st.info(
-        f"This run used the bounding-box anchor "
-        f"({cr.get('reason', 'refinement not enabled')}). It is the A/B baseline. "
-        "Refine an existing run without re-detecting:"
-    )
-    st.code(
-        f"python run_pipeline.py --from-trajectories "
-        f"{suffixed('trajectories', '.csv', tag)} --refine-contacts --tag seg",
-        language="bash",
-    )
+if tracks.empty:
+    st.info("No track summary available for this run.")
 else:
-    m = cr.get("metrics", {}) or {}
-    mg = cr.get("merge", {}) or {}
-    kk = st.columns(4)
-    kk[0].metric("Masks accepted", f"{cr.get('mask_success_rate', 0):.0%}",
-                 help=f"{cr.get('masks_accepted', 0)} of {cr.get('boxes_prompted', 0)} box "
-                      f"prompts over {cr.get('frames_segmented', 0)} frames "
-                      f"({cr.get('weights')} on {cr.get('device')})")
-    shift_m = m.get("median_shift_m")
-    kk[1].metric("Median anchor shift", f"{m.get('median_shift_px', 0)} px",
-                 help=(f"= {shift_m} m on the calibrated ground plane. "
-                       f"p90 {m.get('p90_shift_px')} px." if shift_m is not None
-                       else f"p90 {m.get('p90_shift_px')} px; no metric calibration."))
-    kk[2].metric("Anchors from a mask", mg.get("from_mask", 0),
-                 help=f"{mg.get('from_interpolated_offset', 0)} more were bridged by "
-                      f"interpolating the box->mask OFFSET (never the position); "
-                      f"{mg.get('kept_bbox', 0)} kept the box point.")
-    if pq.get("straight_path_rms_lateral_m") is not None:
-        kk[3].metric("Straight-path RMS lateral",
-                     f"{pq['straight_path_rms_lateral_m']} m",
-                     help=f"Median over {pq.get('straight_tracks_measured', 0)} tracks the "
-                          f"analytics called `straight`, on RAW ground coordinates. Compare "
-                          f"against a --no-refine-contacts run: lower is better.")
-    elif pq.get("speed_jitter") is not None:
-        kk[3].metric("Speed jitter", f"{pq['speed_jitter']}",
-                     help=f"Median per-track std of frame-to-frame speed change "
-                          f"({pq.get('speed_jitter_unit', '')}). Lower is better.")
+    # One row per road user: lifetime/path facts from track_summary, speed and
+    # acceleration from the kinematics export. Merged here rather than in the
+    # pipeline so each stays a single-purpose artifact.
+    reg = tracks.copy()
+    if not kin.empty:
+        # Take only what track_summary does not already carry, so the merge cannot
+        # produce _x/_y suffixed duplicates of mean_speed_kph and friends.
+        kin_cols = ["track_id"] + [c for c in kin.columns if c not in tracks.columns]
+        reg = reg.merge(kin[kin_cols], on="track_id", how="left")
 
-    g1, g2 = st.columns([1.3, 1], gap="large")
+    f1, f2, f3 = st.columns([2, 2, 1], gap="medium")
+    with f1:
+        pick_class = st.multiselect(
+            "vehicle class", sorted(reg["class"].dropna().unique()), default=[],
+            placeholder="all classes",
+        )
+    with f2:
+        search = st.text_input("find vehicle by ID", placeholder="e.g. 42")
+    with f3:
+        only_moved = st.checkbox("moved only", value=False,
+                                 help="hide vehicles that never exceeded the stationary threshold")
 
-    with g1:
-        st.markdown("**The falsifiable prediction**")
-        bands = m.get("by_image_row_band", {})
-        if bands:
-            labels = list(bands)
-            vals = [bands[k]["median_shift_px"] for k in labels]
-            fig = go.Figure(go.Bar(
-                x=labels, y=vals, marker_color="#64dcf0",
-                text=[f"{v:.1f}" for v in vals], textposition="outside",
-                hovertemplate="%{x}<br>%{y:.2f} px<extra></extra>",
+    view = reg
+    if pick_class:
+        view = view[view["class"].isin(pick_class)]
+    if search.strip():
+        view = view[view["track_id"].astype(str).str.contains(search.strip())]
+    if only_moved and "moving_fraction" in view:
+        view = view[view["moving_fraction"].fillna(0) > 0.05]
+
+    cols = [c for c in [
+        "track_id", "class", "class_source", "length_m", "width_m",
+        "first_t", "last_t", "visible_s", "n_obs",
+        "mean_speed_kph", "mean_moving_speed_kph", "p85_speed_kph", "max_speed_kph",
+        "p95_accel_ms2", "p5_decel_ms2", "path_len_m", "stationary_s", "turn_type",
+    ] if c in view.columns]
+    st.dataframe(view[cols], use_container_width=True, hide_index=True, height=340)
+    st.caption(f"{len(view)} of {len(reg)} road users shown")
+    st.download_button("Download vehicle register CSV", view.to_csv(index=False),
+                       file_name="vehicle_register.csv", mime="text/csv")
+    if not boxes.empty:
+        st.download_button("Download detection boxes CSV", boxes.to_csv(index=False),
+                           file_name=f"boxes_{tag or 'default'}.csv", mime="text/csv")
+
+    # ------------------------------------------------------ single vehicle drill-down
+    st.markdown("#### Individual vehicle")
+    ids = view["track_id"].tolist() or reg["track_id"].tolist()
+    sel = st.selectbox("vehicle ID", ids, format_func=lambda i: f"#{int(i)}")
+    row = reg[reg["track_id"] == sel].iloc[0]
+    trace = obs[obs["track_id"] == sel].sort_values("frame") if not obs.empty else pd.DataFrame()
+
+    colr = CLASS_COLOR.get(str(row.get("class")), "#7d8794")
+    st.markdown(
+        f"<span class='pill' style='background:{colr}22;color:{colr}'>"
+        f"#{int(sel)} &middot; {str(row.get('class', '?')).upper()}</span>",
+        unsafe_allow_html=True,
+    )
+
+    m = st.columns(5, gap="small")
+    def _fmt(v, unit="", nd=1):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return "n/a"
+        return f"{f:.{nd}f}{unit}" if f == f else "n/a"
+
+    m[0].metric("Measured size",
+                f"{_fmt(row.get('length_m'), 'm', 2)} x {_fmt(row.get('width_m'), 'm', 2)}")
+    m[1].metric("Journey speed", _fmt(row.get("mean_speed_kph"), " km/h"))
+    m[2].metric("Cruise speed", _fmt(row.get("mean_moving_speed_kph"), " km/h"))
+    m[3].metric("Peak accel / decel",
+                f"{_fmt(row.get('p95_accel_ms2'), '', 2)} / {_fmt(row.get('p5_decel_ms2'), '', 2)}")
+    m[4].metric("Tracked for", _fmt(row.get("visible_s"), " s"))
+
+    st.markdown(
+        f"<div class='caveat'>Classified as <b>{row.get('class', '?')}</b> because "
+        f"<code>class_source = {row.get('class_source', 'model')}</code>. "
+        "Sizes are consistent relative measurements from the calibrated ground plane, "
+        "biased upwards by vehicle height - not catalogue dimensions.</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not trace.empty:
+        g1, g2 = st.columns(2, gap="large")
+        with g1:
+            st.markdown("**Speed and acceleration over time**")
+            speed_col = "speed_kph" if calibrated and trace["speed_kph"].notna().any() else "speed_px_s"
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=trace["timestamp"], y=trace[speed_col], mode="lines",
+                line=dict(color=colr, width=2), name="speed",
+            ))
+            if calibrated and "accel_kph_s" in trace and trace["accel_kph_s"].notna().any():
+                fig.add_trace(go.Scatter(
+                    x=trace["timestamp"], y=trace["accel_kph_s"] / 3.6, mode="lines",
+                    line=dict(color="#64dcf0", width=1.2), name="accel (m/s2)", yaxis="y2",
+                ))
+            fig.update_layout(
+                height=300, margin=dict(l=0, r=0, t=8, b=0),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#12151a",
+                xaxis=dict(title="time (s)", gridcolor="#1f242c"),
+                yaxis=dict(title="km/h" if speed_col == "speed_kph" else "px/s",
+                           gridcolor="#1f242c"),
+                yaxis2=dict(title="m/s2", overlaying="y", side="right", showgrid=False),
+                legend=dict(orientation="h", y=1.14, x=0, title=None),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        with g2:
+            st.markdown("**Path travelled**")
+            use_m = calibrated and trace["sx"].notna().any()
+            xs, ys = (trace["sx"], trace["sy"]) if use_m else (trace["x"], trace["y"])
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys, mode="lines+markers",
+                line=dict(color=colr, width=2), marker=dict(size=3),
+                hovertemplate="t=%{customdata:.1f}s<extra></extra>",
+                customdata=trace["timestamp"],
             ))
             fig.update_layout(
                 height=300, margin=dict(l=0, r=0, t=8, b=0),
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#12151a",
-                xaxis=dict(title="image rows (top of frame -> bottom)", gridcolor="#1f242c"),
-                yaxis=dict(title="median shift (px)", gridcolor="#1f242c"),
+                xaxis=dict(title="east (m)" if use_m else "x (px)", gridcolor="#1f242c"),
+                yaxis=dict(title="north (m)" if use_m else "y (px)", gridcolor="#1f242c",
+                           autorange=None if use_m else "reversed",
+                           scaleanchor="x", scaleratio=1),
             )
             st.plotly_chart(fig, use_container_width=True)
-            held = all(a >= b for a, b in zip(vals, vals[1:]))
-            if held:
-                st.success(
-                    "Prediction held: the measured shift decreases monotonically from the "
-                    "top of the frame (~50deg off-nadir) to the bottom (~4deg), which is the "
-                    "signature of real roof displacement rather than estimator noise."
-                )
-            else:
-                st.warning(
-                    "Prediction NOT confirmed: the shift is not monotonic in image row. "
-                    "The geometry says it should be, so treat the refinement as unproven on "
-                    "this footage and check the mask vetting before trusting the anchor. "
-                    "This panel reports the test result, not the hoped-for one."
-                )
-        else:
-            st.caption("Not enough refined observations per row band to test the prediction.")
 
-    with g2:
-        st.markdown("**Shift by class** (predicted to scale with vehicle height)")
-        by_cls = m.get("median_shift_px_by_class", {})
-        rate = m.get("mask_success_rate_by_class", {})
-        if by_cls:
-            t = pd.DataFrame({
-                "class": list(by_cls),
-                "median shift (px)": [by_cls[c] for c in by_cls],
-                "masks": [f"{rate.get(c, 0):.0%}" for c in by_cls],
-            }).sort_values("median shift (px)", ascending=False)
-            st.dataframe(t, hide_index=True, use_container_width=True)
-        st.markdown(
-            "<div class='caveat'>Pedestrians are roughly 15&times;25 px at this altitude - "
-            "the hardest case, and the one with the largest proportional bias. The per-class "
-            "mask rate says plainly whether they worked instead of hiding it in an average."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-    rej = cr.get("rejections", {})
-    with st.expander("Vetting, fallbacks and known limits"):
-        st.markdown(
-            f"**Estimator.** {cr.get('contact_estimator', '')}\n\n"
-            f"**Rejected masks.** {rej if rej else 'none'}\n\n"
-            f"**Per-observation source.** {m.get('by_source', {})} - written to "
-            f"`trajectories.csv` as `contact_source`, so every row states which anchor "
-            f"produced it.\n\n"
-            "**Why gaps are interpolated rather than reverted.** Snapping a single rejected "
-            "frame back to the box point reintroduces a 0.1-1.8 m discontinuity mid-track, "
-            "and a discontinuity is exactly what a centred difference turns into a phantom "
-            "speed spike. Mixing the two anchors within one track is worse than using either "
-            "anchor consistently, so the box->mask offset is bridged and tagged "
-            "`mask_interpolated`.\n\n"
-            "**Bounded, not eliminated.** The contact row is the 92nd percentile of mask "
-            "rows, not `max(v)`, because the dominant failure mode on sunlit aerial imagery "
-            "is a cast shadow leaking the mask downward. A thin shadow tail is ignored "
-            "entirely; a tail large enough to reach past the 92nd percentile still moves the "
-            "estimate, just far less than `max(v)` would. Both cases are covered in "
-            "`tests/test_contact_points.py`.\n\n"
-            "**`x`, `y` are never overwritten.** The box anchor stays in the CSV alongside "
-            "`x_seg`, `y_seg`, which is what makes this comparison possible at all - and "
-            "`segmentation.contact.use: bbox` reverts the whole thing with one key."
-        )
+    # A vehicle can appear as either party in a conflict, so match both id columns.
+    if not events.empty and "track_id" in events:
+        mine = events["track_id"] == sel
+        if "secondary_track_id" in events:
+            mine = mine | (events["secondary_track_id"] == sel)
+        own = events[mine]
+    else:
+        own = pd.DataFrame()
+    if not own.empty:
+        st.markdown(f"**Events involving #{int(sel)}**")
+        ecols = [c for c in ["event_type", "severity", "timestamp", "duration",
+                             "value", "unit", "description"] if c in own.columns]
+        st.dataframe(own[ecols].sort_values("timestamp"), use_container_width=True,
+                     hide_index=True, height=160)
+    else:
+        st.caption("No events recorded for this vehicle.")
 
 st.divider()
 
@@ -596,7 +1006,10 @@ with t1:
 
 with t2:
     isum = summary.get("interactions", {})
-    if isum.get("pairs"):
+    if not calibrated:
+        st.info("Conflict analysis is unavailable without metric calibration. "
+                "Pixel-space proximity is not presented as a safety result.")
+    elif isum.get("pairs"):
         c = st.columns(4)
         c[0].metric("Interacting pairs", isum.get("pairs", 0))
         c[1].metric("Potential conflicts", isum.get("potential_conflicts", 0))
@@ -670,6 +1083,143 @@ with t5:
         st.download_button("Download track summary CSV", tracks.to_csv(index=False),
                            file_name="track_summary.csv", mime="text/csv")
 
+# --------------------------------------------------------------- interpretation
+st.subheader("Automated interpretation")
+st.caption(
+    "A language model reads the measurements and writes them up. It performs no "
+    "analysis of its own and sees no video - only the evidence brief below, which is "
+    "built entirely from the numbers already on this page."
+)
+
+ipath = interp.interpretation_path(OUT_DIR, tag)
+brief = interp.build_evidence(summary, kin, events, tracks)
+saved = load_json(ipath)
+
+ic1, ic2 = st.columns([3, 1], gap="large")
+with ic2:
+    st.markdown("**Evidence brief**")
+    st.caption(
+        f"{len(brief)} sections, {len(json.dumps(brief, default=str)) / 1024:.1f} KB, "
+        f"{sum(len(v) for v in brief.get('notable_vehicles', {}).values())} notable vehicles. "
+        "One API call per run, cached to disk."
+    )
+    st.download_button("Download evidence brief JSON",
+                       json.dumps(brief, indent=1, default=str),
+                       file_name=f"evidence_brief{'_' + tag if tag else ''}.json",
+                       mime="application/json")
+    go_btn = st.button("Generate interpretation" if not saved else "Regenerate",
+                       type="primary" if not saved else "secondary")
+    if not api_key:
+        st.caption("Optional AI write-up is disabled. Video analysis works without it.")
+
+if go_btn:
+    if not api_key:
+        st.info("Optional AI write-up is not configured. Video analysis and results are unaffected.")
+    else:
+        with st.spinner("Reading the measurements..."):
+            try:
+                saved = interp.interpret(brief, api_key, llm_model, base_url=endpoint)
+                with open(ipath, "w", encoding="utf-8") as fh:
+                    json.dump(saved, fh, indent=1, default=str)
+            except Exception as exc:  # surfaced, not swallowed - the key is the usual cause
+                st.error(f"Interpretation failed: {type(exc).__name__}: {exc}")
+                saved = {}
+
+with ic1:
+    if not saved:
+        st.info("No interpretation generated for this run yet.")
+    else:
+        if saved.get("headline"):
+            st.markdown(f"#### {saved['headline']}")
+        if saved.get("scene"):
+            st.write(saved["scene"])
+
+if saved:
+    def _ev(items):
+        return (" &nbsp;·&nbsp; ".join(f"<code>{e}</code>" for e in items)) if items else ""
+
+    findings = saved.get("findings", [])
+    if findings:
+        st.markdown("##### Findings")
+        for f in findings:
+            sev = str(f.get("severity", "low")).lower()
+            col = SEV_COLOR.get(sev, "#7d8794")
+            st.markdown(
+                f"<div style='border-left:3px solid {col};padding:.15rem 0 .35rem .7rem;"
+                f"margin:.5rem 0'>"
+                f"<span class='pill' style='background:{col}22;color:{col}'>{sev}</span>"
+                f"&nbsp;<b>{f.get('title', '')}</b><br>"
+                f"<span style='color:#c3cad6'>{f.get('detail', '')}</span><br>"
+                f"<span style='font-size:.75rem;color:#8b95a5'>evidence: "
+                f"{_ev(f.get('evidence', []))}</span></div>",
+                unsafe_allow_html=True,
+            )
+
+    b1, b2 = st.columns(2, gap="large")
+    with b1:
+        beh = saved.get("behaviours", [])
+        if beh:
+            st.markdown("##### Behaviour patterns")
+            for b in beh:
+                st.markdown(
+                    f"**{b.get('pattern', '')}**  \n"
+                    f"<span style='color:#c3cad6'>{b.get('detail', '')}</span>  \n"
+                    f"<span style='font-size:.75rem;color:#8b95a5'>evidence: "
+                    f"{_ev(b.get('evidence', []))}</span>",
+                    unsafe_allow_html=True,
+                )
+    with b2:
+        anom = saved.get("anomalies", [])
+        if anom:
+            st.markdown("##### Anomalies")
+            for a in anom:
+                conf = str(a.get("confidence", "low")).lower()
+                col = SEV_COLOR.get({"high": "high", "medium": "medium"}.get(conf, "low"),
+                                    "#7d8794")
+                st.markdown(
+                    f"**{a.get('what', '')}** "
+                    f"<span class='pill' style='background:{col}22;color:{col}'>"
+                    f"{conf} confidence</span>  \n"
+                    f"<span style='color:#c3cad6'>{a.get('why_flagged', '')}</span>  \n"
+                    f"<span style='font-size:.78rem;color:#8b95a5'>Innocent reading: "
+                    f"{a.get('alternative_explanation', 'n/a')}</span>  \n"
+                    f"<span style='font-size:.75rem;color:#8b95a5'>evidence: "
+                    f"{_ev(a.get('evidence', []))}</span>",
+                    unsafe_allow_html=True,
+                )
+
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        cav = saved.get("data_caveats", [])
+        if cav:
+            st.markdown("##### Read this before quoting the numbers")
+            for c in cav:
+                st.markdown(f"<div class='caveat'>{c}</div>", unsafe_allow_html=True)
+    with c2:
+        rec = saved.get("recommended_checks", [])
+        if rec:
+            st.markdown("##### What this clip cannot settle")
+            for r in rec:
+                st.markdown(f"- {r}")
+
+    meta = saved.get("_meta", {})
+    if meta:
+        st.caption(
+            f"{meta.get('model', 'model')} · {meta.get('input_tokens', '?')} input / "
+            f"{meta.get('output_tokens', '?')} output tokens · "
+            f"saw {len(meta.get('evidence_keys', []))} evidence sections, no video"
+        )
+    with st.expander("Exactly what the model was given"):
+        st.caption(
+            "The full brief, verbatim. Every figure in the write-up above must trace "
+            "back to something in here - the system prompt forbids introducing any "
+            "number that is not present, and requires an `evidence` list per claim."
+        )
+        st.json(brief, expanded=False)
+    st.download_button("Download interpretation JSON", json.dumps(saved, indent=1, default=str),
+                       file_name=f"interpretation{'_' + tag if tag else ''}.json",
+                       mime="application/json")
+
 # ------------------------------------------------------------------ limitations
 st.divider()
 with st.expander("Limitations and what we deliberately do not claim", expanded=False):
@@ -677,7 +1227,8 @@ with st.expander("Limitations and what we deliberately do not claim", expanded=F
         """
 | Area | What we claim | What we do **not** claim |
 |---|---|---|
-| **Classes** | Detector classes: pedestrian, bicycle, car, motorcycle, bus, truck | The model does **not** distinguish LGV from HGV. That split is a footprint-size heuristic from calibration, tagged `class_source` in the CSV |
+| **Classes** | Fine-grained classes (car, LGV, HGV, bus, motorcycle, bicycle, pedestrian) decided from the vehicle's **measured** ground length, with the deciding signal recorded per vehicle in `class_source` | Not the detector's own class head - it calls 92% of everything "car" from this altitude. Measured length is biased upwards by vehicle height, so sizes are consistent *relative* measurements, not catalogue dimensions. Bus vs HGV is a tie size cannot break, so the model decides it |
+| **Acceleration** | Per-vehicle p95 accel / p5 decel in m/s^2, over a smoothed ground track | Not instantaneous peaks. Acceleration is a second derivative, so raw extremes are dominated by pixel jitter; they are kept in the CSV for audit and flagged when beyond 10 m/s^2 |
 | **Speed** | Estimated km/h from a telemetry-derived ground plane | Not survey-grade. Assumes flat ground; uses the box bottom as the road-contact point |
 | **Stationary** | "Stationary vehicle **candidate**", cross-referenced against detected queues | Not an incident. One clip cannot separate a breakdown from a red light |
 | **Wrong way** | Movement against the **observed dominant flow** of that part of the road, learned from the data | Not a legal violation - we have no HD map of legal carriageway directions |

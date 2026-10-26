@@ -42,6 +42,7 @@ import numpy as np
 # One regex pass per SRT record; DJI's field set varies slightly by model, so
 # every field is looked up independently and missing ones fall back to a default.
 _FRAME_RE = re.compile(r"FrameCnt\s*:\s*(\d+)")
+_CUE_TIME_RE = re.compile(r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->")
 _NUM = r"(-?\d+(?:\.\d+)?)"
 _FIELD_RES = {
     "focal_len": re.compile(r"focal_len\s*:\s*" + _NUM),
@@ -69,6 +70,7 @@ class Telemetry:
     latitude: float
     longitude: float
     dzoom: float = 1.0
+    time_s: float | None = None
 
 
 def parse_dji_srt(path: str) -> dict[int, Telemetry]:
@@ -82,6 +84,11 @@ def parse_dji_srt(path: str) -> dict[int, Telemetry]:
         m = _FRAME_RE.search(block)
         if not m:
             continue
+        tm = _CUE_TIME_RE.search(block)
+        cue_time = None
+        if tm:
+            hh, mm, ss, ms = (int(x) for x in tm.groups())
+            cue_time = hh * 3600.0 + mm * 60.0 + ss + ms / 1000.0
 
         def get(key: str, default: float) -> float:
             fm = _FIELD_RES[key].search(block)
@@ -98,6 +105,7 @@ def parse_dji_srt(path: str) -> dict[int, Telemetry]:
             latitude=get("latitude", 0.0),
             longitude=get("longitude", 0.0),
             dzoom=get("dzoom_ratio", 1.0),
+            time_s=cue_time,
         )
     return records
 
@@ -127,6 +135,7 @@ def median_telemetry(records: dict[int, Telemetry]) -> Telemetry | None:
         latitude=med("latitude"),
         longitude=med("longitude"),
         dzoom=med("dzoom"),
+        time_s=None,
     )
 
 
@@ -136,7 +145,10 @@ def hover_stability(records: dict[int, Telemetry]) -> dict[str, float]:
         return {}
     vals = list(records.values())
     out: dict[str, float] = {}
-    for attr in ("rel_alt", "yaw_deg", "pitch_deg", "roll_deg"):
+    for attr in ("rel_alt", "yaw_deg", "pitch_deg", "roll_deg", "dzoom"):
+        arr = np.array([getattr(v, attr) for v in vals], dtype=float)
+        out[f"{attr}_p5_p95_spread"] = float(np.percentile(arr, 95) - np.percentile(arr, 5))
+    for attr in ("latitude", "longitude"):
         arr = np.array([getattr(v, attr) for v in vals], dtype=float)
         out[f"{attr}_p5_p95_spread"] = float(np.percentile(arr, 95) - np.percentile(arr, 5))
     return out
@@ -268,7 +280,8 @@ class GroundProjector:
         }
 
 
-def build_projector(cfg: dict, image_w: int, image_h: int):
+def build_projector(cfg: dict, image_w: int, image_h: int,
+                    clip_duration_s: float | None = None):
     """
     Assemble a GroundProjector from config + telemetry.
 
@@ -288,9 +301,85 @@ def build_projector(cfg: dict, image_w: int, image_h: int):
         info["reason"] = f"telemetry file not found: {srt_path}"
         return None, info
 
+    # Align an extracted clip with the relevant SRT interval. The upload form's
+    # clip_start_s used to be collected but ignored, so a moving/full-flight SRT
+    # could calibrate a short clip with a pose from somewhere else in the flight.
+    vcfg = cfg.get("video", {}) or {}
+    clip_start = max(0.0, float(vcfg.get("clip_start_s", 0.0)))
+    timed = [r for r in records.values() if r.time_s is not None]
+    if timed:
+        clip_end = clip_start + clip_duration_s if clip_duration_s and clip_duration_s > 0 else float("inf")
+        selected = {r.frame: r for r in timed if clip_start <= r.time_s < clip_end}
+        if not selected:
+            info["reason"] = (
+                f"no telemetry cues overlap requested clip interval "
+                f"[{clip_start:.2f}, {clip_end:.2f}) s"
+            )
+            return None, info
+        records = selected
+    elif clip_start > 0 or (clip_duration_s is not None and clip_duration_s > 0):
+        info["reason"] = "cannot align telemetry to this clip: SRT cues have no timestamps"
+        return None, info
+
     pose = median_telemetry(records)
     if pose is None or pose.rel_alt <= 1.0 or pose.focal_len <= 0.0:
         info["reason"] = "telemetry present but altitude/focal length unusable"
+        return None, info
+
+    # A single pose is only a valid metric model for a nearly static camera.
+    # Translation, gimbal movement, altitude change, or zoom change invalidates
+    # the fixed pixel-to-ground projection. In that case, degrade to image-space
+    # analytics instead of reporting plausible-looking but wrong metres/speeds.
+    stability = hover_stability(records)
+    limits = cfg.get("calibration", {}) or {}
+    min_records = int(limits.get("min_records", 10))
+    min_coverage = float(limits.get("min_duration_coverage", 0.8))
+    max_alt = float(limits.get("max_altitude_spread_m", 0.5))
+    max_att = float(limits.get("max_attitude_spread_deg", 1.5))
+    max_zoom = float(limits.get("max_zoom_spread", 0.02))
+    max_drift = float(limits.get("max_horizontal_drift_m", 5.0))
+    reasons = []
+    if len(records) < min_records:
+        reasons.append(f"only {len(records)} telemetry records (need at least {min_records})")
+    selected_times = [r.time_s for r in records.values() if r.time_s is not None]
+    if clip_duration_s and clip_duration_s > 0 and selected_times:
+        coverage = max(selected_times) - min(selected_times)
+        coverage_ratio = coverage / clip_duration_s
+        stability["clip_time_coverage_ratio"] = coverage_ratio
+        if coverage_ratio < min_coverage:
+            reasons.append(f"telemetry covers {coverage_ratio:.0%} of clip (need {min_coverage:.0%})")
+    if stability.get("rel_alt_p5_p95_spread", 0.0) > max_alt:
+        reasons.append(f"altitude spread exceeds {max_alt:g} m")
+    for axis in ("yaw_deg", "pitch_deg", "roll_deg"):
+        if stability.get(f"{axis}_p5_p95_spread", 0.0) > max_att:
+            reasons.append(f"{axis.replace('_deg', '')} variation exceeds {max_att:g} deg")
+    if stability.get("dzoom_p5_p95_spread", 0.0) > max_zoom:
+        reasons.append(f"zoom spread exceeds {max_zoom:g}")
+
+    # DJI GPS is noisy, so use robust p5-p95 spread and a conservative limit.
+    # This is a drift rejection gate, not a claim of survey-grade positioning.
+    lat = np.array([r.latitude for r in records.values()], dtype=float)
+    lon = np.array([r.longitude for r in records.values()], dtype=float)
+    if np.isfinite(lat).all() and np.isfinite(lon).all() and (np.any(lat != 0) or np.any(lon != 0)):
+        lat0 = float(np.median(lat))
+        north_spread = stability.get("latitude_p5_p95_spread", 0.0) * 111_132.0
+        east_spread = stability.get("longitude_p5_p95_spread", 0.0) * 111_320.0 * math.cos(math.radians(lat0))
+        horizontal_spread = math.hypot(north_spread, east_spread)
+        stability["horizontal_gps_p5_p95_spread_m"] = horizontal_spread
+        if horizontal_spread > max_drift:
+            reasons.append(f"horizontal GPS spread exceeds {max_drift:g} m")
+    else:
+        stability["horizontal_gps_p5_p95_spread_m"] = None
+
+    if reasons:
+        info.update({"reason": "single-pose calibration rejected: " + "; ".join(reasons),
+                     "hover_stability": stability,
+                     "pose_limits": {"min_records": min_records,
+                                     "min_duration_coverage": min_coverage,
+                                     "max_altitude_spread_m": max_alt,
+                                     "max_attitude_spread_deg": max_att,
+                                     "max_zoom_spread": max_zoom,
+                                     "max_horizontal_drift_m": max_drift}})
         return None, info
 
     proj = GroundProjector(
@@ -312,8 +401,15 @@ def build_projector(cfg: dict, image_w: int, image_h: int):
         {
             "source": "dji_srt",
             "records": len(records),
+            "clip_start_s": clip_start,
             "gps": [round(pose.latitude, 6), round(pose.longitude, 6)],
-            "hover_stability": hover_stability(records),
+            "hover_stability": stability,
+            "pose_limits": {"min_records": min_records,
+                            "min_duration_coverage": min_coverage,
+                            "max_altitude_spread_m": max_alt,
+                            "max_attitude_spread_deg": max_att,
+                            "max_zoom_spread": max_zoom,
+                            "max_horizontal_drift_m": max_drift},
             **proj.describe(),
         }
     )

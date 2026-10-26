@@ -17,10 +17,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import sys
 import time
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -29,18 +33,15 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pipeline import analytics, anomalies, interactions, visualize
-from pipeline import contact_points as contact_mod
+from pipeline import analytics, anomalies, classify, interactions, visualize
 from pipeline import road_mask as road_mask_mod
 from pipeline.calibration import build_projector
 from pipeline.detector import load_detector
 from pipeline.tracker import iter_tracked_frames, video_info
 from pipeline.trajectory import (
     TrajectoryStore,
-    apply_contact_refinement,
     apply_track_classes,
     compute_kinematics,
-    contact_use_seg,
     resolve_track_classes,
 )
 
@@ -76,22 +77,35 @@ def main() -> int:
              "expensive stage, so retuning a threshold or adding a new analytic costs "
              "seconds instead of a full re-processing run.",
     )
-    ap.add_argument(
-        "--refine-contacts", dest="refine_contacts", action="store_true", default=None,
-        help="refine trajectory anchors with MobileSAM instance masks (overrides "
-             "segmentation.contact.enabled). Works with --from-trajectories, so an "
-             "existing run can be refined without re-detecting.",
-    )
-    ap.add_argument(
-        "--no-refine-contacts", dest="refine_contacts", action="store_false",
-        help="keep the bbox bottom-centre anchor - the baseline for the A/B comparison",
-    )
     args = ap.parse_args()
     in_tag = args.tag if args.in_tag is None else args.in_tag
 
     cfg = load_config(args.config)
+    configured_weights = str(cfg.get("detector", {}).get("weights", ""))
+    local_weights = os.path.join(os.path.dirname(os.path.abspath(__file__)), configured_weights)
+    if not args.from_trajectories and configured_weights.lower().endswith(".onnx") and not os.path.isfile(local_weights):
+        local_aerial = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "best.pt")
+        if os.path.isfile(local_aerial):
+            cfg["detector"]["weights"] = "models/best.pt"
+            print("Configured ONNX weights not found; using the installed VisDrone detector")
+        else:
+            raise SystemExit(
+                "Configured detector weights are missing. Install the aerial detector with "
+                "`python tools/download_aerial_model.py`."
+            )
     if args.video:
         cfg["video"]["path"] = args.video
+        # Older saved upload configs may still point at the COCO checkpoint.
+        # Switch those upload runs to the aerial model when it is installed.
+        if os.path.normcase(os.path.normpath("outputs/uploads")) in os.path.normcase(os.path.normpath(args.video)):
+            aerial_checkpoint = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "best.pt")
+            if os.path.isfile(aerial_checkpoint):
+                cfg["detector"].update({
+                    "weights": "models/best.pt", "classes": list(range(10)),
+                    "imgsz": 1280, "conf": 0.10, "strict_conf": 0.20,
+                    "small_conf": 0.08,
+                })
+                print("Using the VisDrone aerial detector for uploaded footage")
     if args.srt:
         cfg["telemetry"]["srt_path"] = args.srt
     if args.max_frames is not None:
@@ -100,10 +114,6 @@ def main() -> int:
         cfg["video"]["frame_stride"] = args.stride
     if args.no_video:
         cfg["output"]["write_video"] = False
-    if args.refine_contacts is not None:
-        cfg.setdefault("segmentation", {}).setdefault("contact", {})["enabled"] = args.refine_contacts
-
-    refine_on = bool((cfg.get("segmentation", {}) or {}).get("contact", {}).get("enabled", False))
 
     video_path = cfg["video"]["path"]
     stride = max(1, int(cfg["video"].get("frame_stride", 1)))
@@ -141,22 +151,35 @@ def main() -> int:
             n += 1
         return f"{root}_v{n}{ext}"
 
-    def _contact_line(info: dict) -> str:
-        if not info.get("enabled"):
-            return f"skipped: {info.get('reason', 'disabled')}"
-        s = (f"{info['masks_accepted']}/{info['boxes_prompted']} masks accepted "
-             f"({info['mask_success_rate']:.0%}) over {info['frames_segmented']} frames")
-        if info.get("rejections"):
-            s += f"; rejected {info['rejections']}"
-        return s
-
     vinfo = video_info(video_path)
+    # PyTorch detectors accept dynamic input shapes. Preserve each video's
+    # orientation and aspect ratio instead of forcing portrait uploads into a
+    # landscape canvas; the resulting dimensions are rounded to model stride 32.
+    if str(cfg.get("detector", {}).get("weights", "")).lower().endswith(".pt"):
+        configured_size = cfg["detector"].get("imgsz", 1280)
+        max_side = max(configured_size) if isinstance(configured_size, (list, tuple)) else int(configured_size)
+        scale = min(1.0, max_side / max(vinfo["width"], vinfo["height"]))
+        target_w = max(32, int(round(vinfo["width"] * scale / 32)) * 32)
+        target_h = max(32, int(round(vinfo["height"] * scale / 32)) * 32)
+        cfg["detector"]["imgsz"] = [target_h, target_w]
+        print(f"      adapting detector input to video orientation: {target_h}x{target_w}")
+    detector_path = str(cfg.get("detector", {}).get("weights", ""))
+    if not args.from_trajectories and detector_path.startswith("models/") and not os.path.isfile(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), detector_path
+    )):
+        raise SystemExit(
+            f"Detector weights not found: {detector_path}. Install them with "
+            "`python tools/download_aerial_model.py`."
+        )
     fps = vinfo["fps"]
-    print(f"[1/7] video {video_path}  {vinfo['width']}x{vinfo['height']} @ {fps:.2f}fps  "
+    print(f"[1/6] video {video_path}  {vinfo['width']}x{vinfo['height']} @ {fps:.2f}fps  "
           f"{vinfo['frames']} frames  stride={stride}")
 
     # ---- Calibration -------------------------------------------------------
-    projector, calib_info = build_projector(cfg, vinfo["width"], vinfo["height"])
+    projector, calib_info = build_projector(
+        cfg, vinfo["width"], vinfo["height"],
+        clip_duration_s=vinfo["frames"] / max(vinfo["fps"], 1e-6),
+    )
     calibrated = projector is not None
     if calibrated:
         print(f"      calibrated from DJI telemetry: alt={calib_info['altitude_m']}m  "
@@ -174,15 +197,8 @@ def main() -> int:
     t0 = time.time()
     n_frames = 0
 
-    seg_frame_index = int((cfg.get("segmentation", {}) or {}).get("frame_index", 0))
-    contact_use = "seg" if contact_use_seg(cfg) else "bbox"
-    contact_info: dict = {"enabled": False, "reason": "not requested"}
-    merge_stats: dict = {"applied": False}
-    vehicle_union = None
-    swept_union = None
-    refined = pd.DataFrame()
-
     reuse = args.from_trajectories
+    class_report: dict = {}
     if reuse:
         # Re-analysis path: detection/tracking already happened, so read the saved
         # trajectories and jump straight to analytics.
@@ -192,57 +208,63 @@ def main() -> int:
             traj_path = f"{root}_{in_tag}{ext}" if in_tag else f"{root}{ext}"
         obs = pd.read_csv(traj_path)
         boxes_path = in_path("boxes")
+        if not os.path.exists(boxes_path):
+            # Fall back to the untagged boxes file: --tag names the OUTPUT, and a
+            # re-render usually reads a previous untagged run's boxes.
+            alt = os.path.join(out_dir, "boxes.csv")
+            if os.path.exists(alt):
+                boxes_path = alt
         boxes = pd.read_csv(boxes_path) if os.path.exists(boxes_path) else pd.DataFrame()
+        # A saved trajectories.csv has already had its per-frame labels replaced by a
+        # resolved per-track class, with the model's own output kept in `class_raw`.
+        # Re-classification must vote on the RAW labels; voting on resolved ones just
+        # re-derives the previous answer and reports a 0% override rate.
+        if "class_raw" in obs.columns:
+            obs["class"] = obs["class_raw"]
+            obs = obs.drop(columns=["class_raw"] +
+                           [c for c in ("class_source",) if c in obs.columns])
+            print("      restored raw per-frame labels from class_raw before re-classifying")
         calibrated = "sx" in obs.columns and obs["sx"].notna().any()
         n_frames = int(obs["frame"].nunique())
         elapsed = 1e-6
-        print(f"[2/7] REUSING {traj_path}: {len(obs)} observations, "
+        print(f"[2/6] REUSING {traj_path}: {len(obs)} observations, "
               f"{obs['track_id'].nunique()} tracks - no detection run")
         if boxes.empty:
             print("      (no boxes.csv -> annotated video cannot be re-rendered)")
             cfg["output"]["write_video"] = False
-
-        if refine_on and not boxes.empty:
-            # The architectural payoff, applied to segmentation: boxes.csv holds every
-            # detection, so MobileSAM can re-anchor an existing run without paying for
-            # YOLO again. This is what makes the bbox-vs-mask A/B cheap enough to run.
-            print("[3/7] contact-point refinement (MobileSAM instance masks)")
-            refined, contact_info, vehicle_union, swept_union = contact_mod.refine_contacts(
-                video_path, boxes, cfg, frame_stride=stride, max_frames=max_frames,
-                capture_frame=seg_frame_index,
-            )
-            print("      " + _contact_line(contact_info))
-
-            # Everything derived from the old anchor has to go: speed, bearing and
-            # the footprint-based size split are all functions of position.
-            derived = ["class_raw", "class_source", "sx", "sy", "speed_kph",
-                       "speed_px_s", "bearing_deg", "heading_px_deg", "accel_kph_s"]
-            obs = obs.drop(columns=[c for c in derived if c in obs.columns])
-            # Undo the previous LGV/HGV split so it is re-decided on the new
-            # contact-line footprint rather than frozen from the box-corner one.
-            if "class" in obs.columns:
-                obs["class"] = obs["class"].replace({"lgv": "truck", "hgv": "truck"})
-
-            obs, merge_stats = apply_contact_refinement(obs, refined, projector, use=contact_use)
-            print(f"      anchors: {merge_stats.get('from_mask', 0)} from mask, "
-                  f"{merge_stats.get('from_interpolated_offset', 0)} interpolated, "
-                  f"{merge_stats.get('kept_bbox', 0)} kept bbox")
-
-            print("[4/7] trajectories: kinematics recomputed on the refined anchor")
-            obs = compute_kinematics(obs, fps, cfg, calibrated)
-            classes = resolve_track_classes(obs, cfg, calibrated)
-            obs = apply_track_classes(obs, classes)
-            obs.to_csv(out("trajectories_csv"), index=False)
-            if not refined.empty:
-                refined.to_csv(out_path("segments"), index=False)
-            print(f"      {len(obs)} observations over {obs['track_id'].nunique()} tracks "
-                  f"-> {out('trajectories_csv')}")
-        else:
-            print(f"[3/7] contact-point refinement: {_contact_line(contact_info)}")
-            print("[4/7] trajectories: reused as-is (kinematics already computed)")
+        print("[3/6] trajectories: reused; re-running classification")
+        # Classification is cheap and depends only on geometry, so it is re-run on
+        # reuse rather than trusting whatever labels the CSV was saved with. The
+        # ground dimensions need `depth_m`, which older runs did not record - it can
+        # be recovered from the saved boxes without re-detecting anything, since the
+        # projection is a pure function of the box and the (hovering) camera pose.
+        if calibrated and projector is not None and not boxes.empty and "depth_m" not in obs:
+            bx = boxes.copy()
+            cx = (bx["x1"] + bx["x2"]) / 2.0
+            probes = np.stack([np.c_[cx, bx["y2"]], np.c_[bx["x1"], bx["y2"]],
+                               np.c_[bx["x2"], bx["y2"]], np.c_[cx, bx["y1"]]],
+                              axis=1).reshape(-1, 2)
+            gp = projector.pixels_to_ground(probes).reshape(-1, 4, 2)
+            bx["footprint_m"] = np.linalg.norm(gp[:, 2] - gp[:, 1], axis=1).round(2)
+            bx["depth_m"] = np.linalg.norm(gp[:, 3] - gp[:, 0], axis=1).round(2)
+            obs = obs.drop(columns=[c for c in ("footprint_m", "depth_m") if c in obs.columns])
+            obs = obs.merge(bx[["frame", "track_id", "footprint_m", "depth_m"]],
+                            on=["frame", "track_id"], how="left")
+            print(f"      recovered footprint_m/depth_m for {len(bx)} boxes by reprojection")
+        obs = classify.measure_ground_dimensions(obs)
+        classes = classify.classify_tracks(obs, cfg, calibrated)
+        obs = apply_track_classes(obs, classes)
+        class_report = classify.classification_report(classes)
+        if class_report:
+            print(f"      resolved: {class_report['resolved_by_class']}")
+            print(f"      model would have said: {class_report['model_would_have_said']}")
+            print(f"      measured size overrode the model on "
+                  f"{class_report['size_overrode_model']} tracks "
+                  f"({class_report['size_overrode_model_pct']}%)")
+        obs.to_csv(out("trajectories_csv"), index=False)
     else:
         model, det_settings = load_detector(cfg)
-        print(f"[2/7] detector {det_settings['weights']} on device={det_settings['device']} "
+        print(f"[2/6] detector {det_settings['weights']} on device={det_settings['device']} "
               f"imgsz={det_settings['imgsz']} half={det_settings['half']}")
 
         for fr in iter_tracked_frames(
@@ -254,6 +276,8 @@ def main() -> int:
                 x1, y1, x2, y2 = tr["xyxy"]
                 box_rows.append(
                     {"frame": fr["frame"], "track_id": tr["track_id"],
+                     "class": tr["cls"], "model_label": tr["model_label"],
+                     "class_id": tr["class_id"], "confidence": float(tr["conf"]),
                      "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2)}
                 )
             n_frames += 1
@@ -271,32 +295,23 @@ def main() -> int:
             print("no detections - nothing to analyse")
             return 1
 
-        # ---- Contact-point refinement --------------------------------------
-        # Second pass over the video, before kinematics, because speed and bearing
-        # are derived from position - refining afterwards would leave them
-        # describing the old anchor. See pipeline/contact_points.py.
-        if refine_on:
-            print("[3/7] contact-point refinement (MobileSAM instance masks)")
-            refined, contact_info, vehicle_union, swept_union = contact_mod.refine_contacts(
-                video_path, boxes, cfg, frame_stride=stride, max_frames=max_frames,
-                capture_frame=seg_frame_index,
-            )
-            print("      " + _contact_line(contact_info))
-            raw, merge_stats = apply_contact_refinement(raw, refined, projector, use=contact_use)
-            print(f"      anchors: {merge_stats.get('from_mask', 0)} from mask, "
-                  f"{merge_stats.get('from_interpolated_offset', 0)} interpolated, "
-                  f"{merge_stats.get('kept_bbox', 0)} kept bbox")
-            if not refined.empty:
-                refined.to_csv(out_path("segments"), index=False)
-        else:
-            contact_info = {"enabled": False, "reason": "disabled in config / --no-refine-contacts"}
-            print("[3/7] contact-point refinement: disabled -> bbox bottom-centre anchor")
-
         # ---- Trajectories --------------------------------------------------
-        print("[4/7] trajectories: kinematics + per-track class resolution")
+        print("[3/6] trajectories: kinematics + measured-size classification")
         obs = compute_kinematics(raw, fps, cfg, calibrated)
-        classes = resolve_track_classes(obs, cfg, calibrated)
+        # Fine-grained class comes from MEASURED ground size, not the COCO head
+        # (which called 92% of everything "car" from this altitude). Dimensions
+        # need `heading_px_deg`, so this runs after kinematics.
+        obs = classify.measure_ground_dimensions(obs)
+        classes = classify.classify_tracks(obs, cfg, calibrated)
         obs = apply_track_classes(obs, classes)
+        class_report = classify.classification_report(classes)
+        if class_report:
+            print(f"      resolved: {class_report['resolved_by_class']}")
+            print(f"      model would have said: {class_report['model_would_have_said']}")
+            print(f"      measured size overrode the model on "
+                  f"{class_report['size_overrode_model']} tracks "
+                  f"({class_report['size_overrode_model_pct']}%): "
+                  f"{'; '.join(class_report['override_flow'][:5])}")
         obs.to_csv(out("trajectories_csv"), index=False)
         # Boxes are persisted so --from-trajectories can also re-render the video.
         boxes.to_csv(os.path.join(out_dir, f"boxes{'_' + args.tag if args.tag else ''}.csv"),
@@ -319,7 +334,7 @@ def main() -> int:
     road_mask = None
     road_info = {"enabled": False, "reason": "disabled in config"}
     if cfg.get("segmentation", {}).get("enabled", False):
-        print("[4b/7] road segmentation")
+        print("[3b/6] road segmentation")
         cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(cfg["segmentation"].get("frame_index", 0)))
         ok, seg_frame = cap.read()
@@ -331,10 +346,6 @@ def main() -> int:
             road_mask, road_info = road_mask_mod.build_road_mask(
                 obs, seg_frame, cfg, boxes=boxes,
                 frame_index=int(cfg["segmentation"].get("frame_index", 0)),
-                vehicle_mask=vehicle_union,
-                # The area real vehicle silhouettes actually swept, measured in the
-                # contact-point pass. Replaces the dilated-centre-point guess.
-                swept_mask=swept_union,
             )
             ov = road_mask_mod.render_mask_overlay(
                 seg_frame, road_mask, out_path("road_mask", ".png")
@@ -352,14 +363,19 @@ def main() -> int:
                 obs, filt = road_mask_mod.filter_to_road(
                     obs, road_mask,
                     classes_exempt=tuple(cfg["segmentation"].get("exempt_classes", ["pedestrian"])),
+                    min_on_road_frac=float(cfg["segmentation"].get("min_on_road_fraction", 0.5)),
                 )
                 road_info["filter"] = filt
-                print(f"      off-road filter: dropped {filt['observations_dropped']} of "
-                      f"{filt['observations_before']} observations, "
-                      f"{filt['tracks_dropped_entirely']} tracks removed entirely")
+                print(f"      off-road filter: dropped {filt['tracks_dropped']} of "
+                      f"{filt['tracks_before']} tracks ({filt['observations_dropped']} observations) "
+                      f"- {filt.get('dropped_by_class', {})}")
+                # Boxes must be filtered too, or the renderer would keep drawing
+                # rectangles for tracks that no longer exist in the analytics.
+                if boxes is not None and not boxes.empty:
+                    boxes = boxes[boxes["track_id"].isin(obs["track_id"].unique())].reset_index(drop=True)
 
     # ---- Analytics ---------------------------------------------------------
-    print("[5/7] analytics")
+    print("[4/6] analytics")
     summary = analytics.build_track_summary(obs, cfg, calibrated)
     counts = analytics.class_counts(summary)
     queues = analytics.detect_queues(obs, cfg, calibrated)
@@ -369,15 +385,34 @@ def main() -> int:
     turns = analytics.turning_movements(summary)
     stability = analytics.id_stability_stats(obs, summary, fps, stride)
     stationary = analytics.stationary_candidates(summary, cfg)
+    # LEVEL 2: per-object velocity and acceleration in real units.
+    kin, kin_stats = analytics.build_kinematics(obs, summary, cfg, calibrated)
+    if kin_stats:
+        print(f"      kinematics: {kin_stats['road_users']} road users, fleet mean "
+              f"{kin_stats['fleet_mean_speed_kph']} km/h, hardest braking "
+              f"{kin_stats['hardest_braking_ms2']} m/s2")
 
     inter = interactions.find_interactions(obs, cfg, calibrated)
     headways = interactions.following_headways(obs, inter, calibrated)
     # Duration + population let the summary report conflict RATES, which are
     # comparable across clips of different length and demand; a raw count is not.
     clip_duration_s = float(obs["timestamp"].max() - obs["timestamp"].min()) if not obs.empty else 0.0
-    inter_summary = interactions.interaction_summary(
-        inter, duration_s=clip_duration_s, n_road_users=len(summary)
-    )
+    if calibrated:
+        inter_summary = interactions.interaction_summary(
+            inter, duration_s=clip_duration_s, n_road_users=len(summary)
+        )
+        inter_summary["available"] = True
+        inter_summary["unit"] = "metric"
+    else:
+        inter_summary = {
+            "available": False,
+            "reason": "Metric calibration is required for physical conflict envelopes and closing-speed grading.",
+            "unit": None,
+            "pairs": None,
+            "potential_conflicts": None,
+            "critical": None,
+            "serious": None,
+        }
 
     events = anomalies.build_events(obs, summary, queues, inter, cfg, calibrated)
     events.to_csv(out("events_csv"), index=False)
@@ -388,6 +423,7 @@ def main() -> int:
         ("queues", queues), ("congestion", congestion), ("active_tracks", active),
         ("directional_flow", flow), ("turning_movements", turns),
         ("interactions", inter), ("headways", headways),
+        ("kinematics", kin),
     ):
         p = os.path.join(out_dir, f"{name}{'_' + args.tag if args.tag else ''}.csv")
         (table if table is not None and not table.empty else pd.DataFrame()).to_csv(p, index=False)
@@ -412,25 +448,39 @@ def main() -> int:
         speed_stats = {"unit": "px/s", "basis": "no metric calibration available - km/h not reported",
                        "mean_moving_speed": round(float(obs["speed_px_s"].mean()), 1)}
 
-    # Contact-point refinement is reported with MEASURED effect, not asserted.
-    # `metrics` tests a falsifiable prediction (shift must grow with off-nadir angle
-    # and object height); `path_quality` is computed for every run, refined or not,
-    # so the bbox-vs-mask A/B is a diff of two summary.json files.
-    contact_block = {**contact_info, "merge": merge_stats}
-    if contact_info.get("enabled"):
-        contact_block["metrics"] = contact_mod.contact_metrics(obs, projector)
-    quality = contact_mod.path_quality(obs, summary, calibrated)
-
+    try:
+        with open(args.config, "rb") as config_file:
+            config_hash = hashlib.sha256(config_file.read()).hexdigest()
+    except OSError:
+        config_hash = None
+    effective_config_hash = hashlib.sha256(
+        yaml.safe_dump(cfg, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    package_versions = {}
+    for package in ("ultralytics", "torch", "opencv-python", "numpy", "pandas", "scipy", "PyYAML"):
+        try:
+            package_versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            package_versions[package] = None
     summary_json = {
+        "run": {
+            "tag": args.tag or "default",
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "config_file": os.path.abspath(args.config),
+            "config_sha256": config_hash,
+            "effective_config_sha256": effective_config_hash,
+            "python_version": platform.python_version(),
+            "package_versions": package_versions,
+        },
         "video": {**vinfo, "path": video_path, "stride": stride,
                   "frames_processed": n_frames, "processing_fps": round(n_frames / elapsed, 2)},
         "detector": det_settings,
         "tracker": {"type": "bytetrack", "config": cfg["tracker"]["config"]},
         "calibration": calib_info,
-        "contact_refinement": contact_block,
-        "path_quality": quality,
         "road_segmentation": road_info,
         "counts": counts,
+        "classification": class_report,
+        "kinematics": kin_stats,
         "id_stability": stability,
         "speed": speed_stats,
         "congestion": {
@@ -459,19 +509,9 @@ def main() -> int:
     print(f"      road users: {counts['total']}  {counts['by_class']}")
     print(f"      events: {summary_json['events']['total']}  {summary_json['events']['by_type']}")
     print(f"      interactions: {inter_summary}")
-    if contact_block.get("metrics"):
-        m = contact_block["metrics"]
-        print(f"      contact shift: median {m.get('median_shift_px')}px"
-              + (f" = {m.get('median_shift_m')}m" if m.get("median_shift_m") is not None else "")
-              + f"  by class {m.get('median_shift_px_by_class', {})}")
-        if m.get("by_image_row_band"):
-            trend = {k: v["median_shift_px"] for k, v in m["by_image_row_band"].items()}
-            print(f"      shift by image row (top->bottom, should DECREASE): {trend}")
-    if quality:
-        print(f"      path quality: {quality}")
 
     # ---- Trajectory map ----------------------------------------------------
-    print("[6/7] trajectory map")
+    print("[5/6] trajectory map")
     canvas = visualize.render_trajectory_map(obs, summary, calibrated)
     if canvas is not None:
         mp = os.path.join(out_dir, f"trajectory_map{'_' + args.tag if args.tag else ''}.png")
@@ -481,8 +521,7 @@ def main() -> int:
     # ---- Annotated video ---------------------------------------------------
     if cfg["output"].get("write_video", True):
         vid_out = next_video_path(out("annotated_video"))
-        print(f"[7/7] rendering annotated video -> {vid_out}")
-        ccfg = (cfg.get("segmentation", {}) or {}).get("contact", {}) or {}
+        print(f"[6/6] rendering annotated video -> {vid_out}")
         r = visualize.render_annotated_video(
             video_path=video_path, out_path=vid_out,
             obs=obs, boxes=boxes, summary=summary, events=events,
@@ -491,27 +530,10 @@ def main() -> int:
             trail_len=int(cfg["output"].get("trail_len", 45)),
             max_frames=max_frames,
             road_mask=road_mask,
-            # Draw the path the analytics actually measured, and show the
-            # box -> tyre-line correction so the refinement is visible, not claimed.
-            use_contact_anchor=(contact_use == "seg"),
-            draw_contacts=bool(ccfg.get("draw_contacts", True)),
         )
-        print(f"      -> {r['output']} ({r['frames_written']} frames), "
-              f"trails from {r['trail_anchor']}")
-        root, ext = os.path.splitext(vid_out)
-        web_out = f"{root}_web{ext}"
-        import shutil, subprocess
-        if shutil.which("ffmpeg"):
-            try:
-                subprocess.run(
-                    ["ffmpeg", "-i", vid_out, "-vcodec", "libx264", "-crf", "28", "-y", web_out],
-                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                print(f"      -> web-compatible H.264 video: {web_out}")
-            except Exception as ex:
-                print(f"      (ffmpeg web conversion failed: {ex})")
+        print(f"      -> {r['output']} ({r['frames_written']} frames)")
     else:
-        print("[7/7] skipped annotated video (--no-video)")
+        print("[6/6] skipped annotated video (--no-video)")
 
     print("\nDONE. outputs in", out_dir)
     return 0

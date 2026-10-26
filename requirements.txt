@@ -1,12 +1,13 @@
-# Traffic Intelligence - Level 1
+# Traffic Intelligence - Levels 1-2
 # Python 3.10+
 #
 # GPU note: install a CUDA build of torch for real speed. On a laptop CPU expect
 # ~1 fps at imgsz=1280; a Colab T4 does ~20-25 fps.
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
-ultralytics>=8.3.0      # YOLOv8 detector + bundled ByteTrack tracker
-torch>=2.2.0
+ultralytics>=8.3.0      # YOLOv8 detector, bundled ByteTrack tracker, MobileSAM
+onnxruntime>=1.17.0     # optional legacy ONNX backend; the default aerial model is PyTorch.
+torch>=2.2.0            # device probe, and ultralytics needs it to load .pt weights
 torchvision>=0.17.0
 opencv-python>=4.9.0
 numpy>=1.26.0
@@ -16,6 +17,11 @@ lap>=0.4.0              # linear assignment used by ByteTrack
 PyYAML>=6.0
 streamlit>=1.32.0       # dashboard
 plotly>=5.18.0          # dashboard charts
+imageio-ffmpeg>=0.6.0   # bundled FFmpeg fallback for browser-playable H.264 video
+anthropic>=0.40.0       # LLM interpretation layer (pipeline/interpret.py).
+                        # Imported lazily, so the pipeline and dashboard both run
+                        # without it - only the interpretation section needs it.
+huggingface_hub>=0.24.0 # pinned-revision download of the VisDrone upload detector
 
 # ffmpeg must be on PATH (clip extraction + DJI telemetry subtitle extraction).
 #   Windows: winget install Gyan.FFmpeg

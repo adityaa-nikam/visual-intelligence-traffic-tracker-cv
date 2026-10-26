@@ -1,0 +1,174 @@
+<!doctype html><html><head><meta charset='utf-8'><title>Issue Log</title><style>
+body{max-width:860px;margin:36px auto;padding:0 28px;
+ font-family:Georgia,'Times New Roman',serif;font-size:15px;line-height:1.62;color:#1a1a1a}
+h1{font-size:30px;line-height:1.25;border-bottom:2px solid #222;padding-bottom:10px;margin:0 0 6px}
+h2{font-size:22px;margin:34px 0 10px;border-bottom:1px solid #ccc;padding-bottom:5px}
+h3{font-size:17px;margin:24px 0 8px}
+p{margin:10px 0}
+code{font-family:Consolas,'Courier New',monospace;font-size:13px;
+ background:#f2f2f2;padding:1px 4px;border-radius:3px}
+pre{background:#f7f7f7;border:1px solid #ddd;border-left:3px solid #666;
+ padding:12px 14px;overflow-x:auto;border-radius:3px}
+pre code{background:none;padding:0;font-size:12.5px;line-height:1.45}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px;
+ font-family:Arial,Helvetica,sans-serif}
+th,td{border:1px solid #bbb;padding:6px 10px;text-align:left;vertical-align:top}
+th{background:#ececec;font-weight:bold}
+tr:nth-child(even) td{background:#fafafa}
+hr{border:none;border-top:1px solid #ccc;margin:30px 0}
+ul,ol{margin:10px 0;padding-left:26px}
+li{margin:5px 0}
+em{color:#333}
+</style></head><body><h1>Issues found and how we solved them</h1>
+<p>Every problem hit during the build, the diagnosis, and the fix. This is the engineering record - each entry is something we found by interrogating our own output rather than trusting it.</p>
+<hr>
+<h2>1. The source video was unusable as-is</h2>
+<p><strong>Problem.</strong> 4K, 6.5 GB, ~400 s. At <code>imgsz=1280</code> on CPU a single frame took ~0.9 s, and decoding 4K alone was a bottleneck. A full run would have taken hours.</p>
+<p><strong>Diagnosis.</strong> Resolution was buying us nothing: at ~70 m altitude a car is already ~70 px long at 1920 wide, well inside YOLO&#x27;s usable range.</p>
+<p><strong>Fix.</strong> Cut a 60 s clip and downscale 4K -&gt; 1920 with ffmpeg.</p>
+<pre><code>ffmpeg -ss 120 -i source.MP4 -t 60 -vf scale=1920:-2 -c:v libx264 -preset ultrafast -crf 26 -an -sn data/intersection.mp4</code></pre>
+<p><strong>Why this is safe, not a shortcut.</strong> Focal length <em>in pixels</em> scales with frame width: <code>f_px = (focal_35mm / 36) * image_width</code>. Halve the width and both <code>f_px</code> and the pixel coordinates halve, so the ground projection is <strong>mathematically identical</strong>. Downscaling costs detection recall on small objects, not metric accuracy.</p>
+<hr>
+<h2>2. No GPU, and we could not install one</h2>
+<p><strong>Problem.</strong> <code>torch.cuda.is_available()</code> returned <code>False</code>. CPU inference ran at <strong>1.13 fps</strong> (0.89 s/frame).</p>
+<p><strong>Attempted fix.</strong> Install a CUDA build: <code>pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu126</code></p>
+<p><strong>It failed.</strong></p>
+<pre><code>ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device</code></pre>
+<p><code>shutil.disk_usage</code> showed only <strong>6.5 GB free of 264 GB</strong> on C:. Worse, pip had already partially upgraded torch to <code>2.13.0+cpu</code> (<code>cuda compiled: None</code>).</p>
+<p><strong>Decision: stay on CPU.</strong> Rolling the dice on a torch reinstall with no disk headroom risked breaking a <em>working</em> install mid-hackathon. Two things made this an acceptable call rather than a compromise:</p>
+<ol><li><strong>Architecture absorbs it.</strong> Detection is the only expensive stage and runs <strong>once</strong>. Every analytic reads <code>trajectories.csv</code>, so re-analysis is seconds (see issue 8). Levels 2-5 do not re-pay the detection cost.</li><li><strong>Colab covers the GPU need at zero risk.</strong> <code>Traffic_Intelligence_Colab.ipynb</code> runs the identical code on a free T4 at ~20-25 fps.</li></ol>
+<p><strong>Side lesson.</strong> A first attempt to measure disk usage with <code>du -sh</code> on the Temp directory hung past a 120 s timeout. <code>shutil.disk_usage</code> answered instantly - use the syscall, not a directory walk.</p>
+<hr>
+<h2>3. COCO has no LGV or HGV class</h2>
+<p><strong>Problem.</strong> The deliverable asks for LGV vs HGV. COCO gives <code>truck</code> and <code>bus</code>, full stop. Claiming otherwise would be fabricating a model capability.</p>
+<p><strong>Fix.</strong> Split <code>truck</code> detections by <strong>measured ground footprint</strong>, which the telemetry calibration gives us for free: project both bottom corners of the box to the ground plane and take the p90 of the resulting width across the track&#x27;s life. Above <code>lgv_hgv_split_m: 7.0</code> -&gt; HGV, below -&gt; LGV.</p>
+<p><strong>The honesty mechanism.</strong> Every such track carries <code>class_source=size_heuristic_from_calibration</code> in <code>track_summary.csv</code>, and the dashboard prints the caveat next to the class chart. It is never presented as a model output. Result on the 60 s clip: 18 LGV, 3 HGV.</p>
+<hr>
+<h2>4. Per-frame class flicker double-counted road users</h2>
+<p><strong>Problem.</strong> YOLO changes its mind between frames - the same vehicle is <code>car</code> in one frame and <code>truck</code> in the next. Counting per-frame detections inflates totals and produces nonsense class breakdowns.</p>
+<p><strong>Fix.</strong> Class is resolved <strong>per track, once</strong>, by majority vote across every observation of that track (<code>resolve_track_classes</code>), then written back to all rows. One physical road user = one track = one class = one count.</p>
+<hr>
+<h2>5. Conflict detection fired 12 times in 2 seconds, with an impossible TTC</h2>
+<p><strong>Problem.</strong> The first smoke test reported 12 &quot;potential conflicts&quot; in a 2-second window, with <code>min_ttc_s: 0.01</code> - physically impossible.</p>
+<p><strong>Diagnosis.</strong> Constant-velocity CPA amplifies speed noise. Cars travelling in a line have a large relative-velocity magnitude <code>|dv|</code> purely from jitter, while their actual <strong>closing rate along the line of centres</strong> is near zero. The CPA formula happily returns a tiny <code>t_cpa</code> for that.</p>
+<p><strong>Fix, in two parts:</strong></p>
+<ol><li><strong>Require genuine closing.</strong> Project the relative velocity onto the line of centres and require it to exceed <code>min_closing_speed_kph: 6.0</code>. Plus a <code>ttc_min_s: 0.2</code> floor below which a value is noise by definition. ``<code>python closing = -np.dot(dp, dv) / dist if rel_speed &gt; 1e-3 and closing &gt;= min_closing: t_cpa = -np.dot(dp, dv) / rel_speed**2 </code>``</li><li><strong>Require persistence.</strong> A real conflict develops over ~1 s; jitter fires for one frame. Count trigger frames per pair and drop anything under <code>min_persistence_frames: 5</code>.</li></ol>
+<p><strong>Result.</strong> 12 -&gt; 10 conflicts, <code>min_ttc</code> 0.01 -&gt; 0.23 s, <code>frames_triggered</code> 6-50.</p>
+<p><strong>Then we swept the threshold to check the survivors were not artifacts.</strong> Conflict count stayed stable from <code>ttc_max</code> 2.5 s all the way down to 1.5 s - meaning the survivors are genuinely tight encounters, not pairs sitting just under a threshold. Locked in <code>ttc_max_s: 2.5</code>, <code>min_approach_speed_kph: 10.0</code>.</p>
+<p><strong>The sweep cost zero GPU time</strong> - it re-ran <code>find_interactions</code> against the existing <code>trajectories.csv</code>. That is the architecture paying off in practice.</p>
+<hr>
+<h2>6. On the full clip, 357 of 390 pairs were flagged as conflicts (91%)</h2>
+<p><strong>Problem.</strong> The filters from issue 5 held up on 2 seconds but not on 60. Claiming 357 near-collisions in one minute is not credible.</p>
+<p><strong>Diagnosis.</strong> We looked at the distribution instead of guessing. 73% of conflicts had TTC &lt; 1.0 s - <strong>not</strong> the signature of threshold noise, which would pile up <em>near</em> the threshold. So these were geometrically real. But:</p>
+<table><thead><tr><th></th><th>median</th></tr></thead><tbody><tr><td>closing speed of &quot;critical&quot; conflicts</td><td><strong>9.6 km/h</strong></td></tr><tr><td>miss distance at CPA</td><td><strong>3.34 m</strong></td></tr></tbody></table>
+<p>Two vehicles converging at 2.7 m/s that will pass 3.3 m apart are <strong>creeping in a queue</strong>, not in conflict. The ~1.5 s TTC threshold from the traffic-conflict literature assumes lane-disciplined traffic; in dense mixed traffic low TTC is <em>normal operating behaviour</em>.</p>
+<p><strong>Fix: grade jointly on TTC and closing speed.</strong> Closing speed is the proxy for how much kinetic energy an evasive manoeuvre must absorb.</p>
+<pre><code>critical : TTC &lt;= 1.5s AND closing &gt;= 20 km/h
+serious  : TTC &lt;= 1.5s AND closing &gt;= 12 km/h   (&gt;= 8 km/h if a vulnerable user)
+close    : passed every geometric filter but low-energy -&gt; routine density</code></pre>
+<p>Only critical + serious are reported as conflicts. &quot;Close interaction&quot; is still counted and exported, because in dense traffic it is a genuine <em>density</em> signal - it just is not a safety event. We also report <strong>rates</strong> (per minute, per 100 road users) so the number is comparable across clips.</p>
+<p><strong>Result.</strong> 357 -&gt; 129 conflicts.</p>
+<hr>
+<h2>7. The remaining conflicts were normal oncoming traffic</h2>
+<p><strong>Problem.</strong> After issue 6, one pattern stood out in the critical list: track <code>855</code> appeared in four separate &quot;head-on&quot; conflicts and <code>663</code> in three. A vehicle having four head-on conflicts in a minute is not plausible.</p>
+<p><strong>First hypothesis - wrong-way driving - was wrong.</strong> We checked the bearings: tracks 855 and 663 average ~290 deg, and the scene&#x27;s dominant flows are 270 deg and 90 deg (a two-way east-west road). 290 deg sits <em>inside</em> the main 270 deg stream. They were not driving against traffic; they were just fast (25 and 32 km/h) and therefore met a lot of oncoming vehicles.</p>
+<p><strong>Real diagnosis.</strong> We compared miss distance by interaction geometry:</p>
+<table><thead><tr><th>geometry</th><th>median <code>d_cpa</code></th></tr></thead><tbody><tr><td>crossing</td><td>1.88 m</td></tr><tr><td>following</td><td>1.97 m</td></tr><tr><td>merging</td><td>2.04 m</td></tr><tr><td><strong>head-on</strong></td><td><strong>3.39 m</strong></td></tr></tbody></table>
+<p>33 of 51 head-on conflicts had <code>d_cpa &gt; 2.5 m</code>. A traffic lane is ~3.0-3.5 m wide and a car is ~1.8 m wide, so <strong>3.4 m is exactly the centre-to-centre separation of two vehicles passing normally in adjacent opposing lanes.</strong></p>
+<p><strong>Root cause.</strong> The conflict envelope was built from <code>CLASS_RADIUS_M</code>, an <em>omnidirectional</em> radius of 1.9 m for a car - effectively a half-<em>length</em>. Summed for two cars that is a 3.8 m envelope, <strong>wider than a lane</strong>. Normal oncoming traffic fell inside it.</p>
+<p><strong>Fix.</strong> Size the conflict envelope on <strong>lateral half-width</strong> (<code>CLASS_HALF_WIDTH_M</code>, 0.9 m for a car) with a 1.15 noise margin -&gt; ~2.1 m for a car pair. That admits genuine collision courses and rejects adjacent-lane passing. The omnidirectional radius is retained for the separate sustained-proximity test, where it is correct.</p>
+<p><strong>Result.</strong> 129 -&gt; <strong>51 conflicts (18 critical + 33 serious)</strong>, and every surviving <code>d_cpa</code> is now &lt;= 2.21 m across all four geometries. The final funnel:</p>
+<pre><code>390 pairs within 25 m
+  -&gt; 138 pass TTC + lateral-envelope test
+  -&gt; 51 graded conflicts (18 critical, 33 serious)
+  -&gt; 87 reclassified as close interactions (density, not safety)</code></pre>
+<p>The survivors are convincing: a rear-end risk at 0.86 m miss sustained 68 frames, a bus merging at 1.0 m, a car/motorcycle crossing at 0.83 m.</p>
+<hr>
+<h2>8. Re-running analytics required a 25-minute re-detection</h2>
+<p><strong>Problem.</strong> Fixing issues 6 and 7 changed only the analytics layer, but <code>run_pipeline.py</code> always started from YOLO. Re-deriving the numbers meant 25 min of CPU detection for a change that touched no pixels.</p>
+<p><strong>Fix.</strong> Added <code>--from-trajectories</code>, which skips detection and tracking entirely and re-derives every analytic from a saved <code>trajectories.csv</code>. Bounding boxes are now persisted to <code>boxes.csv</code> too, so even the annotated video can be re-rendered without re-detecting.</p>
+<pre><code>python run_pipeline.py --from-trajectories outputs/trajectories.csv --tag graded</code></pre>
+<p>Runtime: <strong>seconds instead of 25 minutes.</strong> This is the trajectory-first architecture made executable - and it is how Levels 2-5 will add analytics without rebuilding detection.</p>
+<hr>
+<h2>9. A 67.7 km/h top speed at an intersection averaging 17 km/h</h2>
+<p><strong>Problem.</strong> <code>max_speed</code> reported 67.7 km/h while p85 was 23.6 km/h. Either the calibration was broken or a track was corrupted.</p>
+<p><strong>Diagnosis.</strong> Neither - it is a tail artifact, and the numbers proved it:</p>
+<table><thead><tr><th>percentile</th><th>speed</th></tr></thead><tbody><tr><td>p50</td><td>3.1 km/h (includes stopped vehicles)</td></tr><tr><td>p85</td><td>20.4 km/h</td></tr><tr><td>p99</td><td>32.8 km/h</td></tr><tr><td>p99.9</td><td>37.2 km/h</td></tr><tr><td>max</td><td>67.7 km/h</td></tr></tbody></table>
+<p>Only <strong>13 observations out of 69,067 (0.019%)</strong>, across 4 of 292 tracks, exceeded 40 km/h - a few frames of box jitter on fast-moving vehicles.</p>
+<p><strong>Fix.</strong> Report <code>p85_speed</code> as the headline figure (which is also what traffic engineering actually uses) and add <code>robust_max_speed_p99_5</code>. The raw max is retained in <code>summary.json</code> with an explicit <code>max_speed_caveat: &quot;raw max is jitter-sensitive; use p85 / p99.5 for reporting&quot;</code>. We did not silently clip the data - we changed which statistic we quote.</p>
+<hr>
+<h2>10. Track IDs did not survive occlusion</h2>
+<p><strong>Problem.</strong> Default ByteTrack settings dropped IDs when a vehicle passed behind a tree or bus, or sat still long enough at a red light to be treated as gone. Each recovery became a <em>new</em> ID, inflating counts and fragmenting trajectories.</p>
+<p><strong>Fix.</strong> The single highest-value tuning change was <code>track_buffer: 90</code> in <code>config/bytetrack.yaml</code> - ~3 s at 30 fps - plus a lowered <code>track_low_thresh: 0.08</code> so weak detections still feed re-association.</p>
+<p><strong>Measured result</strong> on the 60 s clip: <strong>2,688 gap recoveries</strong> (a track re-linked after missed detections rather than reborn), longest bridged gap <strong>3.07 s</strong>, mean track life 9.85 s, longest 59.96 s - i.e. tracks surviving the entire clip.</p>
+<p><strong>Why we report this metric.</strong> We have no hand-labelled ground truth, so we cannot compute MOTA or IDF1, and we do not quote one. Gap recoveries are the honest, directly measurable evidence for stable identity.</p>
+<hr>
+<h2>11. Stationary vehicles were being reported as incidents</h2>
+<p><strong>Problem.</strong> A vehicle stopped for 20 s at a red light is not a breakdown, but a naive stationary detector reports both identically.</p>
+<p><strong>Fix.</strong> Stationary detection cross-references the queue detector. If a stopped vehicle is inside a detected queue cluster, the event description says so explicitly. The event type is <code>stationary_vehicle_candidate</code> - never &quot;stalled vehicle&quot; or &quot;incident&quot;. One clip cannot distinguish the two causes, so we surface the evidence and let a human decide.</p>
+<hr>
+<h2>12. Wrong-way detection with no HD map</h2>
+<p><strong>Problem.</strong> Detecting illegal wrong-way driving requires knowing the legal direction of each carriageway. We have no HD map.</p>
+<p><strong>Fix.</strong> Learn the dominant flow <strong>from the data</strong>: bin the scene into a grid and compute the circular mean bearing of all traffic per cell. Flag tracks deviating more than <code>wrong_way_deviation_deg: 130</code> from their own cell&#x27;s dominant flow.</p>
+<p><strong>The honest framing.</strong> The event type is <code>against_dominant_flow</code>, not &quot;wrong_way_violation&quot;. It is a flow anomaly. This also correctly avoids false positives on legitimate turning traffic, which follows the local flow.</p>
+<hr>
+<h2>13. <code>half=True</code> spammed a deprecation warning every frame</h2>
+<p><strong>Problem.</strong> Newer Ultralytics warns <code>&#x27;half&#x27; is deprecated ... Use &#x27;quantize&#x27; instead</code> on every <code>model.track()</code> call - 1,798 lines of noise, hiding real output.</p>
+<p><strong>Fix.</strong> Only pass the key when it is actually enabled, so CPU runs never trigger it:</p>
+<pre><code>if det_settings.get(&quot;half&quot;):
+    kw[&quot;half&quot;] = True</code></pre>
+<hr>
+<h2>14. RuntimeWarnings from short tracks</h2>
+<p><strong>Problem.</strong> <code>Mean of empty slice</code> / <code>All-NaN axis encountered</code> from <code>np.nanmean</code>/<code>np.nanmax</code> on tracks too short to have valid smoothed kinematics.</p>
+<p><strong>Assessment.</strong> Cosmetic - the NaN propagates correctly and those tracks are filtered by <code>min_track_frames: 8</code> downstream. Suppressed at the run level with <code>python -W ignore</code> rather than spending build time on it. Logged here because it is a real (if harmless) rough edge, not something we pretend is clean.</p>
+<hr>
+<h2>15. A background run looked hung, and wasn&#x27;t</h2>
+<p><strong>Problem.</strong> The full run&#x27;s log file sat at 0 bytes for minutes. It looked stalled.</p>
+<p><strong>Diagnosis.</strong> Not a hang - <code>grep -vE</code> in the pipeline was <strong>buffering</strong> stdout. <code>tasklist | grep python</code> showed a live process at 245,800 K RSS, working normally.</p>
+<p><strong>Lesson.</strong> Verify with process state, not log output, before killing a long job.</p>
+<hr>
+<h2>16. The annotated video would not play in a browser</h2>
+<p><strong>Problem.</strong> OpenCV writes <code>mp4v</code>, which browsers and the Streamlit player refuse. The 1920p output was also 382 MB.</p>
+<p><strong>Fix.</strong> Re-encode to H.264 once, and have the dashboard prefer <code>annotated_web.mp4</code> when it exists, falling back to the raw file and showing the exact ffmpeg command if it does not.</p>
+<pre><code>ffmpeg -i outputs/annotated.mp4 -vcodec libx264 -crf 28 -pix_fmt yuv420p outputs/annotated_web.mp4</code></pre>
+<hr>
+<h2>17. Seeding SAM with trajectory points segmented the cars, not the road</h2>
+<p><strong>Problem.</strong> Road segmentation was added so analytics could use the <em>carriageway</em> as a denominator instead of the whole frame (a frame is mostly rooftops and vegetation). MobileSAM was chosen: ~40 MB, already inside <code>ultralytics</code>, no new dependency, and because the drone <strong>hovers</strong> it only has to run on a single frame.</p>
+<p>SAM needs prompts. The obvious choice was to prompt it at the trajectory points - after all, those are on the road. The mask came back with a measured agreement of <strong>IoU 0.342</strong>, and SAM covered only <strong>35.8%</strong> of the area traffic had demonstrably driven over, while its own masks covered just 10.5% of the frame.</p>
+<p><strong>Diagnosis.</strong> The tell was in the log line: <em>24 prompts -&gt; 24 segments</em>. Exactly one segment per prompt. SAM is <strong>class-agnostic</strong> - it returns <em>the object under the point</em>, and a trajectory point sits on a <strong>vehicle</strong>. We had asked SAM to segment the road and it had faithfully segmented 24 cars.</p>
+<p><strong>Fix.</strong> Put the prompts on <strong>bare carriageway</strong>:</p>
+<ul><li>exclude any candidate covered by a detection box in the frame being segmented - <code>boxes.csv</code> already records exactly that, and because the aircraft hovers, road a vehicle drove over at t=30 s is bare tarmac at t=0;</li><li>take at most one candidate per 96 px grid cell, so prompts spread across every arm of the junction instead of clustering in the busiest lane.</li></ul>
+<p>SAM&#x27;s coverage of the travelled area went <strong>35.8% -&gt; 56.7%</strong>, and its own mask area went 10.5% -&gt; 27.6% - now comparable to the 26.1% the traffic actually used.</p>
+<hr>
+<h2>18. The road mask then included a rooftop and a tree canopy</h2>
+<p><strong>Problem.</strong> With better seeds, SAM contributed much more area - and the union of &quot;SAM&quot; plus &quot;where traffic drove&quot; now contained a large grey <strong>rooftop</strong> and a big <strong>tree canopy</strong>. Visible immediately in the overlay image.</p>
+<p><strong>Diagnosis.</strong> Same root cause as #17, pointing the other way. SAM has no concept of &quot;road&quot;. Prompted on tarmac, it grows the segment by appearance, and a grey rooftop looks like grey tarmac from 70 m up. This is not a tuning problem - a class-agnostic model cannot be tuned into having a class.</p>
+<p>The consequence would have been silent and bad: the whole point of the mask is to report density <strong>per square metre of road</strong>, and a rooftop in the denominator makes that number meaningless.</p>
+<p><strong>Fix.</strong> Stop treating SAM as an authority and make it a <strong>proposer</strong>:</p>
+<p>&gt; <strong>SAM proposes, the observed traffic vouches.</strong></p>
+<p>Keep the segments separately rather than merging them, then accept a segment only if at least 45% of <em>its own area</em> lies inside the travelled mask. A road segment extending an in-use corridor into its empty lanes passes. A rooftop overlaps the travelled area at roughly zero and is rejected.</p>
+<p>On this footage <strong>13 of 28 segments were rejected</strong>, IoU rose <strong>0.342 -&gt; 0.468</strong>, and the final mask covers 27.2% of the frame against the 26.1% traffic proved - i.e. deliberately conservative. The asymmetry is intentional: an over-inclusive road mask is worse than a slightly tight one.</p>
+<p>Off-road detections are <strong>dimmed in the video but kept in the analytics</strong> by default, because a detection on a verge or footpath may well be a real road user - and pedestrians are exempt from filtering entirely. Deleting vulnerable road users to tidy up a mask would be exactly the wrong trade for a safety system.</p>
+<hr>
+<h2>19. &quot;Small object detection&quot; is a claim, so we measured it</h2>
+<p><strong>Problem.</strong> Aerial video is fundamentally a small-object problem: at 70 m a motorcycle is a few dozen pixels. The textbook responses are to infer at higher resolution and to lower the confidence floor. Both also buy false positives, so &quot;we enabled small-object detection&quot; is not a result.</p>
+<p><strong>Diagnosis.</strong> <code>tools/measure_small_objects.py</code> runs three settings over the same 30 frames sampled evenly across the clip, and reports detections bucketed by <strong>pixel area</strong> plus the fraction landing <strong>inside the road mask</strong> - reusing the segmentation from #17/#18, so the two features validate each other.</p>
+<table><thead><tr><th>Setting</th><th>Detections</th><th>tiny (&lt;400 px)</th><th>small</th><th>medium</th><th>large</th><th>on-road</th><th>median conf</th></tr></thead><tbody><tr><td>1280, conf 0.25 (baseline)</td><td>1,250</td><td>92</td><td>503</td><td>636</td><td>19</td><td><strong>87.6%</strong></td><td>0.522</td></tr><tr><td><strong>1920, conf 0.25</strong></td><td><strong>1,975</strong> (+58%)</td><td><strong>535</strong></td><td>743</td><td>677</td><td>20</td><td><strong>79.5%</strong></td><td>0.469</td></tr><tr><td>1920, conf 0.15</td><td>3,164 (+153%)</td><td>1,140</td><td>1,055</td><td>916</td><td>53</td><td><strong>64.9%</strong></td><td>0.315</td></tr></tbody></table>
+<p><strong>What decided it.</strong> Not the headline count - the <em>shape</em> of the change.</p>
+<p>Going 1280 -&gt; 1920 added <strong>+443 tiny</strong> and +240 small detections but only <strong>+41 medium and +1 large</strong>. That is precisely what extra resolution should do if the gain is real: more pixels cannot reveal a bus you were already seeing. Tiny detections rose <strong>5.8x</strong> (92 -&gt; 535), and 79.5% of all detections still landed on the carriageway.</p>
+<p>Dropping conf to 0.15 behaves like noise instead. It added +280 medium and +34 <strong>large</strong> detections - resolution was unchanged, so a lower floor cannot be finding genuinely new large vehicles, it is admitting duplicates and junk. On-road fraction collapses to <strong>64.9%</strong>: more than a third of detections sit on rooftops and vegetation, which is the signature of hallucination, not recall.</p>
+<p><strong>Fix.</strong> Adopt <code>imgsz: 1920</code> at <code>conf: 0.25</code>. <strong>Reject <code>conf: 0.15</code></strong> despite it having by far the biggest detection count.</p>
+<p>The cost is honest: 1920 inference is roughly 2.2x slower per frame than 1280, which on a CPU-only machine is the difference between a ~25 minute and a ~55 minute pass. On the Colab T4 it is free. <code>summary.json</code> records <code>imgsz</code> for every run, so which setting produced which artifact is never ambiguous.</p>
+<p>We do <strong>not</strong> claim a recall or precision figure. There is no hand-labelled ground truth for this clip, so what is honestly available is the measured delta plus the evidence about its plausibility - which is what the table above is.</p>
+<hr>
+<h2>20. Trajectory trails vanished behind the vehicle</h2>
+<p><strong>Problem.</strong> Trails were drawn over a fixed 45-frame window, so a car&#x27;s path faded out about 1.5 s behind it. Watching the video, you could not see that an ID had survived a long occlusion - which is the single thing Level 1 is scored on.</p>
+<p><strong>Diagnosis.</strong> Not a bug; the window was chosen to stop the frame turning into spaghetti with 30+ simultaneous tracks. Both requirements are real and they conflict.</p>
+<p><strong>Fix.</strong> Two layers instead of one. The <strong>full history from first detection</strong> is drawn thin at 45% brightness, so continuity is visible end to end; the <strong>recent 45 frames</strong> are drawn bright and thickening on top, so current motion still reads clearly. Cheap</p>
+<ul><li>both come from the same <code>trail_by_track</code> array already in memory.</li></ul>
+<hr>
+<h2>The pattern behind all of these</h2>
+<p>Nine of the twenty issues above (4, 5, 6, 7, 9, 11, 17, 18, 19) were found by <strong>interrogating our own output</strong> - looking at distributions, cross-tabulating by category, and asking whether a number was physically plausible - not by seeing a crash.</p>
+<p>The conflict detector is the clearest example. It never threw an error. It produced confident, well-formatted, plausible-looking output at every stage, and it was wrong three times in a row for three completely different reasons: speed noise (issue 5), then dense-traffic norms (issue 6), then a geometry error that made normal oncoming traffic look like head-on collisions (issue 7). Each one was only findable by asking &quot;is this number actually believable?&quot; and then checking a distribution instead of trusting the answer.</p>
+<p>The segmentation work repeated the pattern in miniature, twice in a row and in opposite directions - SAM segmenting cars instead of road (17), then swallowing a rooftop (18) - and both were caught by a single measured number, the overlap between what SAM proposed and where traffic demonstrably drove.</p>
+<p>And issue 19 is the same discipline applied <em>before</em> believing good news: the setting with the largest improvement in detection count is the one we rejected.</p></body></html>

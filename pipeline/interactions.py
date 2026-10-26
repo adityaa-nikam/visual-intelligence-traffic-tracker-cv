@@ -101,7 +101,10 @@ def find_interactions(df: pd.DataFrame, cfg: dict, calibrated: bool) -> pd.DataF
         approach_speed, interaction_type, involves_vulnerable, severity, x, y
     Distances are metres when calibrated, pixels otherwise (see `unit`).
     """
-    if df.empty:
+    # TTC in seconds can be estimated in image coordinates, but conflict
+    # distance envelopes and closing-speed severity require a metric scale.
+    # Do not turn pixel/s into a pseudo-km/h safety result.
+    if df.empty or not calibrated:
         return pd.DataFrame()
 
     icfg = cfg["interactions"]
@@ -120,16 +123,7 @@ def find_interactions(df: pd.DataFrame, cfg: dict, calibrated: bool) -> pd.DataF
     vuln_closing = float(icfg.get("vulnerable_closing_kph", 8.0))
     env_margin = float(icfg.get("conflict_envelope_margin", 1.15))
 
-    if calibrated:
-        xcol, ycol, scol, bcol, unit = "sx", "sy", "speed_kph", "bearing_deg", "m"
-        px_per_m = 1.0
-    else:
-        # Uncalibrated fallback: work in pixels and scale the thresholds by a
-        # nominal pixels-per-metre so the geometry still means something.
-        xcol, ycol, scol, bcol, unit = "x", "y", "speed_px_s", "heading_px_deg", "px"
-        px_per_m = 16.0
-        radius *= px_per_m
-        near_miss_d *= px_per_m
+    xcol, ycol, scol, bcol, unit = "sx", "sy", "speed_kph", "bearing_deg", "m"
 
     d = df.dropna(subset=[xcol, ycol, scol, bcol])
     if d.empty:
@@ -139,10 +133,10 @@ def find_interactions(df: pd.DataFrame, cfg: dict, calibrated: bool) -> pd.DataF
     #   radius   -> omnidirectional, for the sustained-proximity (near miss) test
     #   halfwidth-> lateral clearance, for the collision-course (conflict) test
     d = d.assign(
-        radius=d["class"].map(CLASS_RADIUS_M).fillna(DEFAULT_RADIUS_M) * px_per_m,
+        radius=d["class"].map(CLASS_RADIUS_M).fillna(DEFAULT_RADIUS_M),
         halfwidth=d["class"].map(CLASS_HALF_WIDTH_M).fillna(DEFAULT_HALF_WIDTH_M)
-        * env_margin * px_per_m,
-        speed_ms=d[scol] / (3.6 if calibrated else 1.0),
+        * env_margin,
+        speed_ms=d[scol] / 3.6,
     )
     vx, vy = _velocity_components(d["speed_ms"].to_numpy(), d[bcol].to_numpy())
     d = d.assign(vx=vx, vy=vy)
@@ -232,8 +226,8 @@ def find_interactions(df: pd.DataFrame, cfg: dict, calibrated: bool) -> pd.DataF
                     "ttc_s": round(ttc, 2) if ttc == ttc else np.nan,
                     "d_cpa": round(d_cpa, 2),
                     "min_distance": round(dist, 2),
-                    "closing_speed": round(closing * (3.6 if calibrated else 1.0), 1),
-                    "approach_speed": round(rel_speed * (3.6 if calibrated else 1.0), 1),
+                    "closing_speed": round(closing * 3.6, 1),
+                    "approach_speed": round(rel_speed * 3.6, 1),
                     "interaction_type": itype,
                     "involves_vulnerable": bool(is_vuln),
                     "unit": unit,

@@ -1,3 +1,12 @@
+---
+title: Drone Traffic Intelligence
+emoji: 🚦
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+---
+
 # Drone Traffic Intelligence - Level 1
 
 **Detection and tracking of every road user in drone footage, with stable identities
@@ -18,6 +27,7 @@ compass bearings** instead of pixel velocities.
 
 ```bash
 pip install -r requirements.txt
+python tools/download_aerial_model.py
 ```
 
 Prepare a clip (downscaling 4K -> 1920 costs no metric accuracy - see ISSUES.md #1):
@@ -42,6 +52,66 @@ python run_pipeline.py
 streamlit run app.py
 ```
 
+The dashboard also lets you upload a video and run the pipeline from the browser.
+Uploads use the pinned VisDrone aerial checkpoint installed above; generic COCO
+weights are not silently substituted. DJI `.srt` telemetry is optional; attach the
+matching file to enable metric estimates. Metric calibration is accepted only when
+telemetry indicates a stable pose/zoom and limited GPS drift; otherwise the run
+stays in image-space and physical conflict grading is unavailable. The optional
+single-frame road mask also assumes a fixed or hovering camera.
+
+## Deploy on Streamlit Community Cloud
+
+For the simplest portfolio deployment, Streamlit Community Cloud can deploy
+`app.py` from a GitHub repository. Detector weights are excluded from Git; the
+app downloads and verifies the pinned model on its first start, so the initial
+launch takes longer.
+
+1. Push the project to GitHub. Do not add uploaded videos, telemetry, model
+   weights, or generated `outputs/`; `.gitignore` excludes them.
+2. Sign in at [share.streamlit.io](https://share.streamlit.io), choose **Create app**,
+   select the repository and branch, and set the main file to `app.py`.
+3. In **Advanced settings → Secrets**, add `ISOLATE_SESSION_OUTPUTS = "true"`
+   and save. This keeps visitors' run lists separate. Uploaded files and results
+   are temporary and may disappear when the app restarts; never upload sensitive
+   footage.
+4. Deploy, wait for the first model download to finish, then test with a short,
+   low-resolution aerial clip. Uploads are limited to 100 MB by
+   `.streamlit/config.toml`.
+
+This is the easiest host to try, but it is not the most reliable host for model
+inference. Community Cloud has resource limits that can vary by app; the PyTorch
+video pipeline may be slow or exceed available memory. If the app repeatedly
+restarts or reports resource errors, use the Docker deployment below on a host
+with more memory or a GPU.
+
+## Deploy a demo with Docker
+
+The project includes a CPU-based Docker setup for a Hugging Face Docker Space.
+It installs FFmpeg, installs CPU-only PyTorch, and downloads/verifies the pinned
+aerial detector while the image is built. The first build can take several minutes.
+Hugging Face currently requires a paid account plan to create Docker Spaces even
+on CPU Basic hardware (which has no hourly compute charge); free CPU Spaces also
+sleep when idle. Confirm the current plan and hardware terms before choosing it.
+
+1. Create a new Space on Hugging Face and select **Docker**. Set its visibility
+   to **Public** to share the portfolio demo, or **Private** while testing.
+2. Put this project in a GitHub repository, then push the repository contents to
+   the Space's Git remote (Hugging Face shows the exact URL and Git instructions).
+   The Space reads its Docker settings from the metadata at the top of this file.
+3. Wait for the Space build to finish and open its app URL. Upload a short aerial
+   clip first; CPU-only inference can be slow on longer videos.
+
+The hosted container separates run files by visitor session, so one visitor's
+uploads and results do not appear in another visitor's run list. Those files are
+temporary and may disappear when the Space restarts; do not upload sensitive video.
+The demo is CPU-only, so it is intended for short clips and learning, not production
+or real-time traffic monitoring. Check the host's current resource limits before
+sharing it widely.
+
+To test the same image locally, run `docker build -t drone-traffic .` followed by
+`docker run --rm -p 7860:7860 drone-traffic` and open `http://localhost:7860`.
+
 **No GPU?** Open `Traffic_Intelligence_Colab.ipynb` in Google Colab and pick a T4
 runtime - the same code runs ~20x faster. It reads the video straight from Google
 Drive, so there is nothing to upload.
@@ -52,6 +122,7 @@ Useful flags:
 python run_pipeline.py --max-frames 60 --tag smoke      # fast smoke test
 python run_pipeline.py --no-video                       # analytics only
 python run_pipeline.py --from-trajectories outputs/trajectories.csv --tag retune
+python -m unittest discover -s tests -v
 ```
 
 That last one is the important one - see [Architecture](#architecture) below.
@@ -74,10 +145,6 @@ That last one is the important one - see [Architecture](#architecture) below.
   pinhole -> ground plane                         |
   projection (metres)                             |
         +--------------------+--------------------+
-                             |
-                pipeline/contact_points.py   (MobileSAM instance masks:
-                  bbox bottom-centre  ->      second pass over boxes.csv,
-                  true tyre-contact line      before any kinematics)
                              |
                   pipeline/trajectory.py
               ***  trajectories.csv  ***   <-- the contract
@@ -122,6 +189,11 @@ Three concrete consequences:
    (X east, Y north, Z up), with the aircraft at `Z = rel_alt`.
 3. **Ray-cast** each pixel through the pinhole model onto the plane `Z = 0`.
 
+The SRT cue timestamps are filtered to `video.clip_start_s` and the clip duration;
+the input's clip-start setting is not merely descriptive. The selected interval is
+checked against configured pose, zoom, altitude, and GPS-drift limits before a
+single-pose calibration is accepted. This is a guardrail, not surveyed validation.
+
 A ray pointing above the horizon returns `NaN`, never a fabricated coordinate.
 
 Every road user's **bottom-centre bbox point** is used as the road-contact point,
@@ -136,19 +208,20 @@ three independent checks that would all fail on a broken projection:
 |---|---|---|
 | **Hover stability** | altitude spread 0.023 m, pitch 0.0 deg, yaw 0.4 deg across 6,824 records | Aircraft is genuinely static -> a single fixed camera pose is justified |
 | **Ground scale** | 0.0617 m/px at centre, 97.6 m scene width at 70.47 m altitude | Correct order of magnitude for a 24 mm-equivalent lens at that height |
-| **Speed distribution** | mean 16.7, median 16.8, p85 23.6 km/h | Exactly right for a busy urban intersection. A broken projection gives 300 km/h or 2 km/h |
+| **Speed distribution** | latest saved run v4: mean 16.5, median 16.9, p85 23.4 km/h | Plausibility check only; this is an estimate, not ground-truth validation |
 
-**Without telemetry the system degrades honestly.** It falls back to pixel-space
-analytics and **refuses to print km/h at all** rather than inventing a scale factor.
+**Without telemetry the system degrades honestly.** It falls back to image-space
+analytics, refuses to print km/h, and marks physical conflict analysis unavailable.
 
 ---
 
 ## Detection and tracking
 
-**Detector:** YOLOv8s (COCO), `imgsz=1280`, `conf=0.25`, restricted to the six
-relevant COCO classes - person, bicycle, car, motorcycle, bus, truck. No custom
-training: within a 4-hour budget a pretrained model with tuned inference beats a
-half-trained custom one.
+**Detector:** a YOLOv8n checkpoint fine-tuned on VisDrone, with aerial classes
+mapped to the dashboard vocabulary. Model source, pinned revision, checksum, class
+mapping, and evaluation workflow are documented in
+[MODEL_AND_EVALUATION.md](MODEL_AND_EVALUATION.md). The setup command verifies the
+checkpoint before it is used.
 
 **Tracker:** ByteTrack (bundled with Ultralytics) via `model.track(persist=True)`.
 It keeps low-confidence detections as association candidates instead of discarding
@@ -162,13 +235,13 @@ a vehicle waiting at a red light.
 
 | Metric | 60 s clip |
 |---|---|
-| Road users tracked | 292 |
-| Observations | 69,505 |
-| **Gap recoveries** (re-linked after missed detections) | **2,688** |
-| Longest bridged occlusion | 3.07 s |
-| Mean track life | 9.85 s |
+| Road users tracked | 492 |
+| Observations | 110,779 |
+| **Gap recoveries** (re-linked after missed detections) | **3,426** |
+| Longest bridged occlusion | 3.14 s |
+| Mean track life | 8.94 s |
 | Longest track | 59.96 s (the full clip) |
-| Tracks over 10 s | 99 |
+| Tracks over 10 s | 143 |
 
 We have no hand-labelled ground truth, so **we do not quote MOTA or IDF1** - we
 cannot compute them. Gap recoveries are the honest, directly measurable evidence
@@ -183,100 +256,16 @@ One row per road user per frame in `trajectories.csv`:
 | column | meaning |
 |---|---|
 | `track_id`, `class`, `frame`, `timestamp` | identity and time |
-| `x`, `y` | bottom-centre of bbox, image space - **always** the box point |
-| `x_seg`, `y_seg` | MobileSAM tyre-contact point (see below); `seg_l_x`/`seg_r_x` bound the contact line |
-| `contact_source` | `mask`, `mask_interpolated` or `bbox` - which anchor produced this row |
-| `world_x`, `world_y` | ground-plane projection of the **chosen** anchor, metres |
+| `x`, `y` | bottom-centre of bbox, image space (road-contact point) |
+| `world_x`, `world_y` | raw ground-plane projection, metres |
 | `sx`, `sy` | smoothed ground coordinates (centred moving average) |
 | `speed_kph`, `speed_px_s` | centred difference over a ~0.5 s baseline |
 | `bearing_deg` | true compass bearing (metric); `heading_px_deg` in pixel space |
 | `accel_kph_s` | for sudden-stop detection |
-| `footprint_m` | measured ground width of the contact line (bbox bottom edge if unrefined) |
-| `footprint_seg_m`, `box_w`, `box_h` | mask contact width, and the raw box dimensions |
+| `footprint_m` | measured ground width of the bbox bottom edge |
 
 Speed uses a **centred** difference over a ~0.5 s baseline: long enough to suppress
 per-frame jitter, short enough to preserve real acceleration.
-
-### Ground-contact point: bounding box vs instance mask
-
-The bbox bottom-centre was the original anchor, and `calibration.py` conceded the
-limitation in a comment: *"a box bottom is still an approximation."* On this footage it
-is worse than it sounds. **The gimbal sits at -63 deg pitch, not nadir.** With
-`f_px = 1280` on 1920x1080 the vertical FOV is 45.7 deg, so the frame spans **4.1 deg
-off-nadir at the bottom edge to 49.9 deg at the top**, and an elevated point projects
-displaced radially outward from the nadir by `height * tan(off-nadir)`:
-
-| object | h | bottom of frame (4 deg) | centre (27 deg) | top (50 deg) |
-|---|---|---|---|---|
-| car | 1.5 m | 0.11 m | 0.76 m | 1.78 m |
-| pedestrian | 1.7 m | 0.12 m | 0.87 m | 2.02 m |
-| lgv | 2.5 m | 0.18 m | 1.27 m | 2.97 m |
-| bus / hgv | 3.2 m | 0.23 m | 1.63 m | 3.80 m |
-
-An axis-aligned box wraps the **whole silhouette, roof included**. Its bottom edge `y2`
-is the lowest silhouette pixel (roughly the near tyre line, about right), but its
-horizontal centre `(x1+x2)/2` is the centre of a silhouette *stretched by that radial
-roof displacement*. So `(cx, y2)` **corresponds to no physical feature of the vehicle** -
-its `v` comes from the wheels and its `u` from a roof-contaminated average. Three
-consequences follow from the geometry regardless of the exact magnitude:
-
-1. The bias grows **~17x from the bottom of the frame to the top**, so it does not cancel
-   as a vehicle crosses the scene - it **injects false velocity** into `speed_kph` and
-   `bearing_deg`.
-2. It is **orientation-dependent**, so a *turning* vehicle's box centre shifts even when
-   its true footprint centre does not - spurious motion exactly where turning counts and
-   conflict detection are most sensitive.
-3. For scale, the conflict envelope for two cars is **2.07 m**. In the upper half of the
-   frame the roof-displacement scale is the same order as the entire envelope.
-
-`pipeline/contact_points.py` replaces the anchor with the real tyre-contact line of a
-**MobileSAM instance mask** - the same 40 MB model already used for the road area, but
-prompted with detection *boxes* instead of points:
-
-```
-m      = mask pixels inside the prompt box
-v_c    = percentile(v of m, 92)        # robust bottom, NOT max(v)
-band   = m where v >= v_c - 6px        # the tyre-contact band
-u_c    = median(u of band)             # contact point
-l, r   = p5, p95 of u over band        # true contact-line width -> footprint_m
-```
-
-The percentile is the load-bearing choice: the dominant SAM failure mode on sunlit
-aerial imagery is a **cast shadow leaking the mask downward**. `max(v)` would follow the
-shadow tip an unbounded distance; a percentile bounds the error to the tail SAM actually
-mislabelled. A thin tail is ignored entirely, a fat one degrades the estimate but still
-beats `max(v)` - both cases are pinned in `tests/test_contact_points.py`.
-
-**It runs as a second pass over `boxes.csv`, not inside the tracker.** That is what keeps
-`trajectories.csv` the single contract (no analytic learns SAM exists), lets an
-*existing* run be re-anchored with **no re-detection**, and means a SAM failure cannot
-destroy a completed detection run. One `SAM(img, bboxes=[...])` call per frame carries
-every box in that frame: one image encode, N cheap decodes.
-
-**Both anchors are kept.** `x, y` are never overwritten; `segmentation.contact.use`
-chooses which feeds `world_x/world_y`. So the improvement is *measured* rather than
-asserted, every row records its own `contact_source`, and a bad result on other footage
-is one config key from being reverted. Masks that fail vetting (area vs the prompt box,
-containment inside it) do **not** snap back to the box point mid-track - the box->mask
-*offset* is interpolated instead and tagged `mask_interpolated`, because a 0.1-1.8 m
-discontinuity is precisely what a centred difference turns into a phantom speed spike.
-Mixing anchors within one track is worse than using either anchor consistently.
-
-The A/B, costing one detection run in total:
-
-```bash
-python run_pipeline.py --no-refine-contacts --tag bbox
-```
-
-```bash
-python run_pipeline.py --from-trajectories outputs/trajectories_bbox.csv --refine-contacts --tag seg
-```
-
-`summary.json` then carries `contact_refinement` and `path_quality` for both runs, and
-the dashboard renders the comparison. The **falsifiable** check is the one that matters:
-the measured shift must grow monotonically from the bottom of the frame to the top and
-scale with object height. A flat profile falsifies the method, and the dashboard says so
-in that case rather than quietly showing a bar chart.
 
 ---
 
@@ -303,7 +292,8 @@ judge are excluded rather than forced into a bucket.
 
 **Directional flow.** True 16-point compass distribution when calibrated.
 
-**Interactions (surrogate safety).** For every pair within 25 m, solve for the
+**Interactions (surrogate safety).** Only with accepted metric calibration, for
+every pair within 25 m, solve for the
 closest point of approach under constant velocity:
 
 ```
@@ -326,7 +316,12 @@ in three independent ways:
    for two cars) is **wider than a traffic lane**, so normal oncoming traffic read as
    head-on collisions -> size the envelope on **lateral half-width** instead.
 
-The final funnel on the 60 s clip:
+The original conflict-tuning study below is an archived run; the latest saved v4
+summary reports 131 potential conflicts (59 critical, 72 serious). These are
+heuristic surrogate-safety candidates and have not been validated against labeled
+near-miss outcomes.
+
+The archived tuning funnel:
 
 ```
 390 pairs within 25 m
@@ -341,25 +336,21 @@ value, unit, description`.
 
 ---
 
-## Results (60 s, 1798 frames, urban intersection)
+## Archived baseline results (run v4; 60 s, 1798 frames, urban intersection)
+
+These numbers are from an earlier COCO-based run and are preserved as historical
+baseline results; they are not the current VisDrone upload model's evaluation.
 
 | | |
 |---|---|
-| Road users | **292** - 231 car, 18 LGV, 3 HGV, 2 bus, 9 motorcycle, 29 pedestrian |
-| Motor vehicles / vulnerable users | 263 / 38 |
-| Speed | mean 16.7, median 16.8, **p85 23.6** km/h |
-| Queues | 91 detections, largest 22 vehicles, longest 78.7 m |
-| Turning movements | 86 straight, 14 left, 14 right |
-| Potential conflicts | **51** (18 critical, 33 serious) |
-| Congestion | peak score 0.686 |
-| Events | 387 across 8 types |
-
-These are from the **bbox-anchored** run, i.e. `--no-refine-contacts`. Re-anchoring on
-mask contact points moves positions by design, so every figure here will shift - the
-conflict counts in particular, since they were earned through the three fixes in
-ISSUES.md #5/#6/#7. They are regenerated from the refined run only *after* the
-`contact_refinement` metrics confirm the shift moved in the predicted direction; a sharp
-move in conflicts gets investigated rather than assumed to be the better number.
+| Road users | **492** - 228 car, 53 LGV, 15 HGV, 12 bus, 55 motorcycle, 129 pedestrian |
+| Motor vehicles / vulnerable users | 363 / 184 |
+| Speed | mean 16.5, median 16.9, **p85 23.4** km/h |
+| Queues | 101 detections, largest 41 vehicles, longest 88.9 m |
+| Turning movements | 108 straight, 15 left, 27 right, 1 U-turn |
+| Potential conflicts | **131** (59 critical, 72 serious) |
+| Congestion | peak score 0.645 |
+| Events | 650 across 9 types |
 
 ---
 
@@ -367,16 +358,14 @@ move in conflicts gets investigated rather than assumed to be the better number.
 
 | File | Contents |
 |---|---|
-| `outputs/annotated.mp4` | Boxes, IDs, class, live speed, trails, conflict lines, HUD. Renders are never overwritten - later ones land as `_v2`, `_v3` |
+| `outputs/annotated.mp4` | Boxes, IDs, class, live speed, trails, conflict lines, HUD |
 | `outputs/trajectories.csv` | **The core artifact** - every observation of every road user |
-| `outputs/segments.csv` | MobileSAM contact points per `(frame, track_id)`, with the contact-line bounds |
 | `outputs/events.csv` | All detected events, uniform schema |
-| `outputs/summary.json` | Headline metrics, calibration evidence, method notes, `contact_refinement` + `path_quality` |
+| `outputs/summary.json` | Headline metrics, calibration evidence, method notes |
 | `outputs/track_summary.csv` | One row per road user |
 | `outputs/trajectory_map.png` | Top-down trajectory plot with a metric scale bar |
-| `outputs/road_mask.png` | Drivable-area overlay (MobileSAM + observed trajectories) |
 | `queues / congestion / turning_movements / directional_flow / interactions / headways .csv` | Per-analytic tables |
-| `outputs/boxes.csv` | Raw boxes, so video can be re-rendered - and trajectories re-anchored - without re-detecting |
+| `outputs/boxes.csv` | Raw boxes, so video can be re-rendered without re-detecting |
 
 ---
 
@@ -387,12 +376,11 @@ worse than an honest estimate.
 
 | Area | We claim | We do **not** claim |
 |---|---|---|
-| **Classes** | The six COCO classes the detector actually outputs | That the model distinguishes LGV from HGV. **It does not.** That split is a footprint-size heuristic from calibration, tagged `class_source=size_heuristic_from_calibration` |
-| **Speed** | "Estimated speed", from a telemetry-derived ground plane | Survey-grade. Assumes flat ground. Headline figure is p85, not the jitter-sensitive raw max |
-| **Contact point** | The tyre-contact line of a MobileSAM instance mask where one passed vetting, tagged per observation in `contact_source`, with the measured shift reported in `summary.json` | That every object was segmented, or that the mask is exact. Masks that fail vetting keep an interpolated box->mask offset; a cast shadow reaching past the 92nd percentile of mask rows still moves the estimate, just far less than `max(v)` would |
+| **Classes** | VisDrone aerial classes mapped to the project's labels; optional calibrated size refinement | That the model distinguishes every three-wheeler subtype or that labels have measured accuracy without ground-truth evaluation |
+| **Speed** | "Estimated speed", from a telemetry-derived ground plane | Survey-grade. Assumes flat ground; uses the bbox bottom as the contact point. Headline figure is p85, not the jitter-sensitive raw max |
 | **Stationary** | "Stationary vehicle **candidate**", cross-referenced against queues | An incident. One clip cannot separate a breakdown from a red light |
 | **Wrong way** | `against_dominant_flow` - movement against the *observed* flow of that part of the road, learned from data | A legal violation. We have no HD map of legal carriageway directions |
-| **Conflicts** | "**Potential** conflict", graded, from a constant-velocity CPA projection | A collision, or a certified traffic-conflict-technique score. A constant-velocity model cannot know a driver was already braking |
+| **Conflicts** | Calibrated "**potential conflict**" indicators from a constant-velocity CPA projection; unavailable without metric calibration | A collision, or a certified traffic-conflict-technique score. A constant-velocity model cannot know a driver was already braking |
 | **Congestion** | A transparent weighted score for operator triage | A certified level of service - that needs lane geometry and capacity |
 | **Coordinates** | Metres relative to the aircraft, in one common ground frame | Absolute survey coordinates. GPS is recorded, so results *could* be georeferenced |
 
@@ -411,24 +399,15 @@ config/bytetrack.yaml     tracker params (track_buffer: 90 is the key one)
 pipeline/calibration.py   DJI telemetry -> metric ground projection
 pipeline/detector.py      YOLOv8 loading, class mapping, colours
 pipeline/tracker.py       ByteTrack, yields per-frame records
-pipeline/contact_points.py MobileSAM instance masks -> tyre-contact anchors
-pipeline/road_mask.py     MobileSAM + observed traffic -> drivable area
 pipeline/trajectory.py    kinematics, per-track class resolution
 pipeline/analytics.py     counts, queues, congestion, turning, dwell, ID stability
 pipeline/interactions.py  CPA / TTC, conflict grading, headways
 pipeline/anomalies.py     event detectors -> events.csv
 pipeline/visualize.py     annotated video + trajectory map
-tests/                    contact-point estimator + merge tests (no SAM, no video)
-run_pipeline.py           orchestration (7 stages)
+run_pipeline.py           orchestration (6 stages)
 app.py                     Streamlit dashboard
 make_colab.py             regenerates the Colab notebook
 ISSUES.md                 every problem hit, diagnosed and fixed
-```
-
-Tests need neither a GPU nor the video:
-
-```bash
-python -m pytest tests/ -q
 ```
 
 **Extending for Level 2+:** write a function that takes the trajectory DataFrame and

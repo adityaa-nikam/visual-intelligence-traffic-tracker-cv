@@ -89,29 +89,58 @@ def stationary_events(df, summary, queues, cfg, calibrated) -> list[dict]:
 
 
 def unusual_dwell_events(df, summary, queues, cfg, calibrated) -> list[dict]:
-    """Road users present far longer than typical for the scene."""
+    """
+    Road users present far longer than typical for the scene.
+
+    A bare "visible for > 25 s" test is close to useless on this footage: it fired on
+    27 tracks, every one of them a car that was stationary for 100% of its life at the
+    kerbside. Those are PARKED VEHICLES, not anomalies - and because the event
+    duration equalled the whole clip, the annotated video kept all 27 highlighted for
+    all 1798 frames, which made the overlay read as though the entire scene was
+    anomalous.
+
+    So the two cases are separated on the fraction of life spent stationary:
+
+      * never meaningfully moved  -> `parked_vehicle_candidate`, informational.
+        Honest label: from one clip we cannot distinguish legal parking from a
+        vehicle abandoned in a live lane, so it stays a "candidate".
+      * moved, then dwelled long  -> `unusual_dwell`, the case actually worth a
+        look, because something interrupted a journey in progress.
+    """
     if summary.empty:
         return []
     limit = float(cfg["anomalies"].get("unusual_dwell_s", 25.0))
+    parked_frac = float(cfg["anomalies"].get("parked_stationary_fraction", 0.9))
     d = summary[summary["visible_s"] >= limit]
-    return [
-        _event(
-            event_type="unusual_dwell",
+    out = []
+    for _, r in d.iterrows():
+        vis = float(r["visible_s"])
+        stat = float(r.get("stationary_s", 0.0))
+        frac = stat / vis if vis > 0 else 0.0
+        parked = frac >= parked_frac
+        moving_s = max(vis - stat, 0.0)
+        out.append(_event(
+            event_type="parked_vehicle_candidate" if parked else "unusual_dwell",
             track_id=int(r["track_id"]),
             timestamp=r["first_t"],
-            duration=r["visible_s"],
+            # Parked vehicles get a short marker window instead of the whole clip:
+            # a 60 s event window would light the object up for the entire video.
+            duration=3.0 if parked else vis,
             x=r["last_x"],
             y=r["last_y"],
             severity="low",
-            value=r["visible_s"],
+            value=round(vis, 2),
             unit="s",
             description=(
-                f"{r['class']} #{int(r['track_id'])} in view {r['visible_s']:.1f}s "
-                f"({r['stationary_s']:.1f}s of it stationary)"
+                f"{r['class']} #{int(r['track_id'])} stationary {stat:.1f}s of "
+                f"{vis:.1f}s in view ({frac:.0%}) - parked, or stopped for the whole "
+                "observation. Not distinguishable from an obstruction in one clip."
+                if parked else
+                f"{r['class']} #{int(r['track_id'])} in view {vis:.1f}s, moving for "
+                f"{moving_s:.1f}s then dwelling {stat:.1f}s - a journey interrupted"
             ),
-        )
-        for _, r in d.iterrows()
-    ]
+        ))
+    return out
 
 
 def sudden_stop_events(df, summary, queues, cfg, calibrated) -> list[dict]:
