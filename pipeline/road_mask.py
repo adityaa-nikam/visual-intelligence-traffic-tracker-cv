@@ -43,68 +43,34 @@ def _largest_components(mask: np.ndarray, min_area_frac: float = 0.005) -> np.nd
     return keep
 
 
-def fill_holes(mask: np.ndarray) -> np.ndarray:
-    """Fill all internal holes in a binary mask."""
-    if mask is None or not np.any(mask):
-        return mask
-    contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    filled = np.zeros_like(mask, dtype=np.uint8)
-    if contours:
-        cv2.drawContours(filled, contours, -1, 255, -1)
-    return filled
-
-
-def smooth_mask(mask: np.ndarray, close_k: int = 31, blur_k: int = 15) -> np.ndarray:
-    """Smooth jagged mask boundaries using morphological closing, hole-filling, and Gaussian filtering."""
-    if mask is None or not np.any(mask):
-        return mask
-    m = fill_holes(mask)
-    if close_k > 0:
-        k_size = max(3, int(close_k) | 1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
-        m = fill_holes(m)
-    if blur_k > 0:
-        b_size = max(3, int(blur_k) | 1)
-        blurred = cv2.GaussianBlur(m, (b_size, b_size), 0)
-        _, m = cv2.threshold(blurred, 120, 255, cv2.THRESH_BINARY)
-        m = fill_holes(m)
-    return _largest_components(m)
-
-
 def travelled_mask(
     obs: pd.DataFrame,
     shape: tuple[int, int],
-    lane_width_px: int = 40,
+    lane_width_px: int = 26,
 ) -> np.ndarray:
     """
     Empirical drivable area: where road users were actually observed.
 
-    Connects consecutive observations into continuous trajectory corridors,
-    dilates by a realistic lane width, fills internal holes, and smooths boundaries.
+    Uses the bbox bottom-centre (the road-contact point), dilated by roughly a
+    lane half-width, then closed to bridge gaps between lanes.
     """
     h, w = shape
     canvas = np.zeros((h, w), np.uint8)
-    if obs is None or obs.empty:
+    pts = obs.dropna(subset=["x", "y"])[["x", "y"]].to_numpy()
+    if len(pts) == 0:
         return canvas
 
-    xcol = "x_seg" if ("x_seg" in obs.columns and obs["x_seg"].notna().any()) else "x"
-    ycol = "y_seg" if ("y_seg" in obs.columns and obs["y_seg"].notna().any()) else "y"
+    xi = np.clip(pts[:, 0].astype(np.int32), 0, w - 1)
+    yi = np.clip(pts[:, 1].astype(np.int32), 0, h - 1)
+    canvas[yi, xi] = 255
 
-    pts_df = obs.dropna(subset=[xcol, ycol])
-    if pts_df.empty:
-        return canvas
-
-    lane_r = max(20, int(lane_width_px))
-    for tid, group in pts_df.groupby("track_id"):
-        g_pts = group.sort_values("frame")[[xcol, ycol]].to_numpy(np.int32)
-        if len(g_pts) > 1:
-            cv2.polylines(canvas, [g_pts], False, 255, thickness=lane_r * 2, lineType=cv2.LINE_AA)
-        for pt in g_pts:
-            cv2.circle(canvas, (int(pt[0]), int(pt[1])), lane_r, 255, -1, lineType=cv2.LINE_AA)
-
-    close_k = max(35, int(lane_r * 2.5) | 1)
-    return smooth_mask(canvas, close_k=close_k, blur_k=21)
+    k = max(3, int(lane_width_px) | 1)
+    canvas = cv2.dilate(canvas, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    # Close across lane gaps, then fill enclosed holes (traffic islands excepted).
+    big = max(3, int(lane_width_px * 2) | 1)
+    canvas = cv2.morphologyEx(canvas, cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (big, big)))
+    return _largest_components(canvas)
 
 
 def _seed_points(
@@ -153,47 +119,20 @@ def _seed_points(
 
 
 def _occupied_mask(boxes: pd.DataFrame, frame_index: int, shape: tuple[int, int],
-                   pad: int = 6, vehicle_mask: np.ndarray | None = None) -> np.ndarray | None:
-    """
-    Pixels a road user occupies in the frame being segmented, so seeds avoid them.
-
-    A detection BOX is a crude stand-in: it excludes the vehicle plus a lot of the
-    bare tarmac around it, which throws away seed candidates. When the contact-point
-    pass has already produced instance masks for this frame
-    (`contact_points.refine_contacts(capture_frame=...)`), those masks are used
-    instead - they cost nothing extra here and free up roughly the difference
-    between a box and the silhouette inside it.
-
-    Boxes are still excluded individually where no mask covers them, so an object
-    MobileSAM declined to segment cannot quietly become a seed.
-    """
+                   pad: int = 6) -> np.ndarray | None:
+    """Pixels covered by a detection box in the frame being segmented."""
     if boxes is None or boxes.empty or "frame" not in boxes:
         return None
     g = boxes[boxes["frame"] == frame_index]
-    if g.empty and vehicle_mask is None:
+    if g.empty:
         return None
     h, w = shape
     occ = np.zeros((h, w), np.uint8)
-
-    vm = None
-    if vehicle_mask is not None and np.any(vehicle_mask):
-        vm = vehicle_mask
-        if vm.shape[:2] != (h, w):
-            vm = cv2.resize(vm, (w, h), interpolation=cv2.INTER_NEAREST)
-        vm = vm > 0
-        occ[vm] = 255
-        # Grow slightly so a seed cannot land on a bumper just outside the silhouette.
-        k = max(3, int(pad) * 2 + 1)
-        occ = cv2.dilate(occ, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-
     for r in g.itertuples(index=False):
         x1 = max(int(r.x1) - pad, 0)
         y1 = max(int(r.y1) - pad, 0)
         x2 = min(int(r.x2) + pad, w - 1)
         y2 = min(int(r.y2) + pad, h - 1)
-        if vm is not None and vm[max(int(r.y1), 0):max(int(r.y2), 0),
-                                max(int(r.x1), 0):max(int(r.x2), 0)].any():
-            continue                          # already excluded precisely by its mask
         occ[y1:y2, x1:x2] = 255
     return occ
 
@@ -291,24 +230,9 @@ def build_road_mask(
     cfg: dict,
     boxes: pd.DataFrame | None = None,
     frame_index: int = 0,
-    vehicle_mask: np.ndarray | None = None,
-    swept_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """
     Combine the empirical and geometric estimates into one drivable-area mask.
-
-    `vehicle_mask` is the optional union of the instance masks the contact-point
-    pass already produced for `frame_index` - if supplied, seeds avoid vehicle
-    PIXELS rather than whole detection boxes.
-
-    `swept_mask` is the union of EVERY accepted instance mask over every processed
-    frame. When present it replaces the dilated-trajectory estimate as the empirical
-    evidence, and that is a large accuracy win: the old estimate rasterised
-    trajectory CENTRE POINTS and dilated them by a guessed `lane_width_px`, so its
-    width was a tunable guess and its shape was a string of overlapping discs (the
-    characteristic lumpy amoeba). A swept union is the actual area real vehicle
-    silhouettes covered - correct width by construction, no free parameter, and it
-    reaches the true lane edges wherever traffic did.
 
     Returns (mask_uint8, info). `info` carries the measured agreement between the
     two independent estimates, so the mask's quality is reported rather than assumed.
@@ -317,29 +241,7 @@ def build_road_mask(
     h, w = frame.shape[:2]
 
     lane_px = int(scfg.get("lane_width_px", 26))
-    swept_ok = swept_mask is not None and np.any(swept_mask)
-    if swept_ok:
-        sw = swept_mask
-        if sw.shape[:2] != (h, w):
-            sw = cv2.resize(sw, (w, h), interpolation=cv2.INTER_NEAREST)
-        trav = (sw > 0).astype(np.uint8) * 255
-        # Close across the gaps BETWEEN passes. Consecutive vehicles leave a dotted
-        # trail at any finite frame rate, and adjacent lanes are only bridged where
-        # something drove the line between them; one close at roughly a lane width
-        # turns that into continuous carriageway without inflating its outer edge.
-        close_px = int(scfg.get("swept_close_px", max(lane_px, 25)))
-        trav = smooth_mask(trav, close_k=close_px, blur_k=max(3, close_px // 3))
-        trav_source = (
-            f"union of {int((sw > 0).sum())} px of accepted vehicle instance masks "
-            f"swept over all processed frames, closed by {close_px}px"
-        )
-    else:
-        trav = travelled_mask(obs, (h, w), lane_width_px=lane_px)
-        trav_source = (
-            f"trajectory centre-points dilated by lane_width_px={lane_px} - a GUESS; "
-            "run with segmentation.contact.enabled to replace this with the measured "
-            "swept area of real vehicle silhouettes"
-        )
+    trav = travelled_mask(obs, (h, w), lane_width_px=lane_px)
     trav_frac = float((trav > 0).mean())
 
     info = {
@@ -348,16 +250,15 @@ def build_road_mask(
             "drone hovers (altitude spread 0.023 m, pitch 0.0 deg, yaw 0.4 deg over "
             "6824 telemetry records), so one mask serves every frame"
         ),
-        "empirical_source": trav_source,
         "travelled_area_frac": round(trav_frac, 4),
         "sam": None,
         "agreement": None,
-        "source": "swept_only" if swept_ok else "travelled_only",
+        "source": "travelled_only",
     }
 
     sam = None
     if scfg.get("use_sam", True):
-        occ = _occupied_mask(boxes, frame_index, (h, w), vehicle_mask=vehicle_mask)
+        occ = _occupied_mask(boxes, frame_index, (h, w))
         seeds = _seed_points(
             trav, occ, max_seeds=int(scfg.get("sam_max_seeds", 24)),
             grid=int(scfg.get("seed_grid_px", 96)),
@@ -365,10 +266,6 @@ def build_road_mask(
         info["seeds"] = {
             "count": int(len(seeds)),
             "excluded_occupied_pixels": occ is not None,
-            "exclusion_source": (
-                "instance masks from the contact-point pass, boxes where no mask"
-                if vehicle_mask is not None and np.any(vehicle_mask) else "detection boxes"
-            ),
             "note": "prompts placed on bare carriageway, not on vehicles - see road_mask._seed_points",
         }
         segs, note = sam_segments(frame, seeds, weights=scfg.get("sam_weights", "mobile_sam.pt"))
@@ -401,8 +298,8 @@ def build_road_mask(
     # Union, not intersection: we want road SAM found that was simply unused this
     # minute (empty lanes, far arms) included, while the travelled mask guarantees
     # we never lose road we have direct evidence for.
-    combined = smooth_mask(cv2.bitwise_or(trav, sam), close_k=25, blur_k=15)
-    info["source"] = "sam_union_swept" if swept_ok else "sam_union_travelled"
+    combined = _largest_components(cv2.bitwise_or(trav, sam))
+    info["source"] = "sam_union_travelled"
     info["road_area_frac"] = round(float((combined > 0).mean()), 4)
     return combined, info
 
@@ -431,13 +328,31 @@ def mask_ground_area_m2(mask: np.ndarray, projector) -> float | None:
     return round(total, 1)
 
 
-def filter_to_road(obs: pd.DataFrame, mask: np.ndarray, classes_exempt=("pedestrian",)) -> tuple[pd.DataFrame, dict]:
+def filter_to_road(
+    obs: pd.DataFrame,
+    mask: np.ndarray,
+    classes_exempt=("pedestrian",),
+    min_on_road_frac: float = 0.5,
+) -> tuple[pd.DataFrame, dict]:
     """
-    Drop observations whose road-contact point falls outside the drivable area.
+    Remove tracks that are not on the carriageway - judged over the WHOLE track.
 
-    Pedestrians are exempt by default: footpaths are legitimately off-carriageway,
-    so masking them out would delete real vulnerable road users - exactly the
-    opposite of what a safety system should do.
+    The decision is deliberately per-track, not per-observation. A per-observation
+    filter looks correct and behaves badly: a real vehicle whose contact point
+    wobbles across the mask edge for a few frames gets its trajectory chopped into
+    fragments, which is precisely the ID instability Level 1 is scored on. Judging
+    the whole track instead means a road user either belongs to the road scene or
+    does not.
+
+    What this removes, concretely: YOLO fires on parked cars in private courtyards,
+    on rooftop plant, and on vehicle-shaped clutter in vegetation. Those objects
+    are never on the carriageway for any part of their life, so their on-road
+    fraction is ~0 while a genuine road user's is ~1. The two populations are
+    cleanly separated, which is why a single 50% threshold is enough.
+
+    Pedestrians are exempt: footpaths are legitimately off-carriageway, and
+    deleting vulnerable road users to tidy up the picture is the wrong trade for a
+    safety system to make.
     """
     if obs.empty or mask is None:
         return obs, {"applied": False}
@@ -445,19 +360,26 @@ def filter_to_road(obs: pd.DataFrame, mask: np.ndarray, classes_exempt=("pedestr
     h, w = mask.shape[:2]
     xi = np.clip(obs["x"].to_numpy(), 0, w - 1).astype(np.int32)
     yi = np.clip(obs["y"].to_numpy(), 0, h - 1).astype(np.int32)
-    on_road = mask[yi, xi] > 0
-    exempt = obs["class"].isin(classes_exempt).to_numpy()
-    keep = on_road | exempt
+    d = obs.assign(_on=(mask[yi, xi] > 0))
 
-    dropped_tracks = sorted(set(obs.loc[~keep, "track_id"]) - set(obs.loc[keep, "track_id"]))
+    frac = d.groupby("track_id")["_on"].mean()
+    exempt_tracks = set(d.loc[d["class"].isin(classes_exempt), "track_id"].unique())
+    off_tracks = {int(t) for t, f in frac.items()
+                  if f < min_on_road_frac and int(t) not in exempt_tracks}
+
+    keep = ~obs["track_id"].isin(off_tracks)
+    dropped = obs.loc[~keep]
     stats = {
         "applied": True,
-        "observations_before": int(len(obs)),
-        "observations_kept": int(keep.sum()),
-        "observations_dropped": int((~keep).sum()),
-        "tracks_dropped_entirely": len(dropped_tracks),
+        "mode": "per-track (a track is kept or dropped as a whole)",
+        "min_on_road_fraction": min_on_road_frac,
+        "tracks_before": int(obs["track_id"].nunique()),
+        "tracks_dropped": len(off_tracks),
+        "observations_dropped": int(len(dropped)),
+        "dropped_by_class": dropped["class"].value_counts().to_dict() if len(dropped) else {},
         "exempt_classes": list(classes_exempt),
-        "note": "off-road detections removed; pedestrians exempt (footpaths are legitimately off-carriageway)",
+        "note": ("tracks spending under half their life on the carriageway are treated as "
+                 "off-road false positives (courtyards, rooftops, vegetation); pedestrians exempt"),
     }
     return obs[keep].reset_index(drop=True), stats
 

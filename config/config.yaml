@@ -2,19 +2,18 @@
 # All tunables live here so analytics can be re-run without touching code.
 
 video:
-  # Working clip (1920-wide, downscaled from the 4K original for speed). Detection
-  # quality is unaffected - YOLO letterboxes to imgsz=1280 whatever the source is -
-  # but 4K costs ~4x the decode and writes a ~1.5 GB annotated video.
-  #   ffmpeg -i data/intersection.mp4 -vf scale=1920:1080 -c:v libx264 -crf 20 \
-  #          -preset veryfast -an data/intersection_1920.mp4
-  path: data/intersection_1920.mp4
-  # Seconds into the ORIGINAL video where this clip starts. Informational only:
-  # calibration takes the MEDIAN pose over the whole SRT (valid because the drone
-  # hovers), so it never indexes telemetry by frame and this value is not read by
-  # the pipeline - only by make_colab.py.
-  clip_start_s: 0.0
-  # Process every Nth frame. 1 = every frame. 2 = half the work, still smooth trails.
-  frame_stride: 1
+  # Working clip (1920-wide, downscaled from the 4K original for speed).
+  path: data/intersection.mp4
+  # Seconds into the ORIGINAL video where this clip starts.
+  # Needed to align the DJI telemetry (SRT) with the clip's frames.
+  clip_start_s: 120.0
+  # Process every Nth frame. Measured: detection runs at 0.41 fps on this 8-core CPU
+  # at native 1920, so every frame would take ~73 min. At stride 2 a vehicle at 20 km/h
+  # moves ~6 px between processed frames against a ~40 px box, so ByteTrack's IoU
+  # association is unaffected - and the 90-frame track_buffer becomes 6 s of real time
+  # instead of 3 s, which bridges occlusions better, not worse. Kinematics divide by
+  # the effective fps, so speeds stay correct.
+  frame_stride: 3
   # Cap frames processed (null = whole clip). Useful for quick smoke tests.
   max_frames: null
 
@@ -24,15 +23,31 @@ telemetry:
   # DJI reports focal_len as a 35mm-equivalent value.
   sensor_width_35mm: 36.0
 
+calibration:
+  # A single-pose projection is accepted only for nearly static footage.
+  # Spreads are robust p5-p95 ranges over the selected SRT clip interval.
+  min_records: 10
+  min_duration_coverage: 0.8
+  max_altitude_spread_m: 0.5
+  max_attitude_spread_deg: 1.5
+  max_zoom_spread: 0.02
+  max_horizontal_drift_m: 5.0
+
 detector:
-  weights: models/yolov8s.pt
+  # VisDrone-trained model for the top-down UAV viewpoint. Download and verify with:
+  # python tools/download_aerial_model.py
+  weights: models/best.pt
+  # Scalar input size adapts to landscape/portrait video while preserving aspect ratio.
   imgsz: 1280
-  conf: 0.25
+  conf: 0.10
+  strict_conf: 0.20
+  small_conf: 0.08
   iou: 0.6
   device: auto            # auto -> cuda if available, else cpu
   half: true              # fp16 on GPU
-  # COCO ids we care about: person, bicycle, car, motorcycle, bus, truck
-  classes: [0, 1, 2, 3, 5, 7]
+  # VisDrone ids: pedestrian, people, bicycle, car, van, truck, tricycle,
+  # awning-tricycle, bus, motor. pipeline/detector.py maps these to app labels.
+  classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 tracker:
   config: config/bytetrack.yaml
@@ -57,9 +72,31 @@ analytics:
     # Heading change (degrees) that separates a turn from going straight.
     straight_max_deg: 25.0
     min_path_len_m: 12.0        # ignore tracks too short to judge a turn
-  # Calibration-derived size split for the COCO "truck" class.
+  # Calibration-derived size split for the model's "truck" class.
   # Honest label: this is a footprint-length heuristic, not a model class.
   lgv_hgv_split_m: 7.0
+
+classification:
+  # LEVEL 2 - fine-grained vehicle classification from MEASURED size.
+  #
+  # Historic COCO experiments showed severe top-down class collapse. Current
+  # upload runs use the aerial VisDrone model; calibrated size is a supplemental
+  # heuristic and remains disabled when geometry is unavailable.
+  #
+  # Thresholds are on the SOLVED ground length and are calibrated against the
+  # distribution this footage produces, not copied from a vehicle catalogue.
+  # De-rotating an axis-aligned box compresses absolute scale (a 4.4 m car
+  # measures ~2.2 m); what classification needs is a monotonic ordering, and the
+  # measured class-median ratios are car->lgv 1.74x and lgv->hgv 1.84x.
+  size_bands:
+    - [3.0, car]
+    - [4.5, lgv]          # van / light goods
+    # above 4.5 m -> "large": bus vs HGV is a tie the tape measure cannot break,
+    # so the model's opinion decides it and the source column says so.
+  min_size_observations: 8  # usable (non-degenerate) solves before size may override
+  # Keep these labels from the aerial detector; their classes are not reliably
+  # distinguishable by the project's axis-aligned-box size heuristic.
+  model_owned_classes: [pedestrian, bicycle, motorcycle]
 
 interactions:
   neighbour_radius_m: 25.0      # only test pairs closer than this
@@ -96,6 +133,10 @@ anomalies:
   wrong_way_min_speed_kph: 8.0
   wrong_way_deviation_deg: 130.0  # vs the dominant flow of its corridor
   unusual_dwell_s: 25.0
+  # A vehicle stationary for this fraction of its observed life never moved at all,
+  # so it is a PARKED vehicle, not an interrupted journey. Separating the two stopped
+  # 27 kerbside cars being reported as anomalies for the whole clip (ISSUES.md #20).
+  parked_stationary_fraction: 0.9
 
 segmentation:
   # Road-area segmentation. Cheap because the drone HOVERS (measured: altitude
@@ -105,43 +146,28 @@ segmentation:
   frame_index: 0                # frame the mask is computed from
   use_sam: true                 # MobileSAM (~40 MB) via ultralytics; no new dependency
   sam_weights: mobile_sam.pt
-  sam_max_seeds: 24             # trajectory points used to prompt SAM
+  sam_max_seeds: 48             # bare-carriageway points used to prompt SAM
+  seed_grid_px: 96              # at most one prompt per grid cell -> spread over all arms
+  # SAM proposes, observed traffic decides. A SAM segment is accepted only if this
+  # fraction of it lies inside the travelled area. Measured: without this test SAM
+  # contributed a rooftop and a tree canopy, because it is class-agnostic and grey
+  # roof looks like grey tarmac. 13 of 28 segments get rejected on this footage.
+  min_segment_overlap: 0.45
   # The empirical estimate: rasterised trajectory points dilated by ~a lane width.
   # 26 px at 0.0617 m/px is about 1.6 m, roughly half a lane.
-  lane_width_px: 45
+  lane_width_px: 26
   # Off-road detections are DIMMED in the video by default but NOT deleted from
   # the analytics, because an off-road detection may be a real road user on a
   # footpath or verge. Turn this on to actually drop them.
-  filter_detections: false
+  # Drop tracks that are not on the carriageway. Measured on this clip, the
+  # on-road fraction over 292 tracks is perfectly bimodal: 38 tracks sit at
+  # 0-10%, 254 sit at 90-100%, and NOTHING falls in between. The threshold value
+  # therefore does not matter - there is nothing ambiguous to threshold. The 38
+  # are YOLO firing on parked cars in courtyards, rooftop plant and clutter in
+  # vegetation; the 254 are road users.
+  filter_detections: true
+  min_on_road_fraction: 0.5
   exempt_classes: [pedestrian]  # never filtered - footpaths are legitimately off-carriageway
-
-  # ---- Instance-mask contact points (accurate trajectories) ----------------
-  # The trajectory anchor was the bbox bottom-centre. With the gimbal at -63 deg
-  # the frame spans 4 deg off-nadir at the bottom edge to 50 deg at the top, and an
-  # elevated point projects displaced radially by height*tan(off-nadir): 0.11 m for
-  # a car at the bottom of the frame, 1.78 m at the top, 3.80 m for a bus. A box
-  # wraps the whole silhouette INCLUDING THE ROOF, so its horizontal centre is
-  # roof-contaminated while its bottom edge is the wheel line - the point belongs to
-  # no physical feature, and the bias grows ~17x up the frame, so it does not cancel
-  # and instead injects false velocity. A MobileSAM instance mask gives the real
-  # tyre-contact line. See pipeline/contact_points.py.
-  contact:
-    enabled: true
-    stride: 1                     # segment every Nth processed frame; >1 interpolates the offset
-    use: seg                      # seg | bbox -> which point feeds world_x/world_y
-    contact_percentile: 92        # robust "bottom of mask"; max(v) would follow cast shadows
-    band_px: 6                    # thickness of the tyre-contact band
-    # Vetting, relative to the PROMPT BOX (the meaningful denominator for an
-    # instance). A mask larger than its own box grabbed the carriageway or a shadow.
-    min_mask_bbox_area_ratio: 0.15
-    max_mask_bbox_area_ratio: 1.10
-    min_containment: 0.70         # fraction of mask area lying inside the prompt box
-    max_objects_per_frame: 64     # cap decode cost; largest boxes are kept first
-    device: auto
-    # Overlay the tyre-contact line and a connector from the box point to it, so
-    # the correction is visible in the video. Drawn from the persisted numbers in
-    # segments.csv - no masks are stored and segmentation is never re-run.
-    draw_contacts: true
 
 output:
   dir: outputs

@@ -13,6 +13,9 @@ FILES = [
     "requirements.txt",
     "README.md",
     "ISSUES.md",
+    "MODEL_AND_EVALUATION.md",
+    "tools/download_aerial_model.py",
+    "tools/evaluate_labeled_run.py",
     "config/config.yaml",
     "config/bytetrack.yaml",
     "pipeline/__init__.py",
@@ -20,10 +23,13 @@ FILES = [
     "pipeline/detector.py",
     "pipeline/tracker.py",
     "pipeline/trajectory.py",
+    "pipeline/classify.py",
     "pipeline/analytics.py",
     "pipeline/interactions.py",
     "pipeline/anomalies.py",
     "pipeline/visualize.py",
+    "pipeline/road_mask.py",
+    "pipeline/interpret.py",
 ]
 
 OUT = "traffic_ai_code.zip"

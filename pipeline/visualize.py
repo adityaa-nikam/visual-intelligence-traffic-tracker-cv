@@ -18,61 +18,22 @@ from pipeline.detector import CLASS_COLORS
 
 WARN = (60, 90, 255)      # BGR red-orange for anomalies
 WARN_SOFT = (60, 170, 255)
-CONTACT = (255, 205, 70)  # mask tyre-contact line
 PANEL_BG = (28, 26, 24)
 TEXT = (240, 240, 240)
 MUTED = (170, 170, 170)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+# Severity ordering, so the most serious active event wins the label on a track.
+SEV_RANK = {"low": 0, "medium": 1, "high": 2}
+
 
 def _label(img, text, org, colour, scale=0.45, thick=1, pad=3):
-    """
-    Text with a filled backing box so it stays readable over any road surface.
-
-    Accepts "\n" and stacks lines, so a caller can put the identity on one line and
-    the speed under it instead of running them together. The box is clamped to the
-    frame, which matters at the right-hand edge where a label used to be drawn
-    partly off-canvas and silently cropped.
-    """
-    lines = str(text).split("\n")
-    sizes = [cv2.getTextSize(ln, FONT, scale, thick) for ln in lines]
-    tw = max(w for (w, _), _ in sizes)
-    lh = max(h for (_, h), _ in sizes) + 4
-    bw, bh = tw + pad * 2, lh * len(lines) + pad * 2
-
+    """Text with a filled backing box so it stays readable over any road surface."""
+    (w, h), base = cv2.getTextSize(text, FONT, scale, thick)
     x, y = int(org[0]), int(org[1])
-    x = max(0, min(x, img.shape[1] - bw))
-    y = max(bh, min(y, img.shape[0] - 1))
-
-    cv2.rectangle(img, (x, y - bh), (x + bw, y), colour, -1)
-    for i, ln in enumerate(lines):
-        cv2.putText(img, ln, (x + pad, y - bh + pad + lh * (i + 1) - 4),
-                    FONT, scale, (18, 18, 18), thick, cv2.LINE_AA)
-
-
-def _trail_points(hist: np.ndarray, max_jump_px: float) -> list[np.ndarray]:
-    """
-    Split one track's history into continuous runs, dropping implausible jumps.
-
-    A single bad position - a tracker ID swap, or a box snapping to a different
-    vehicle - otherwise draws a straight line clean across the frame. Breaking the
-    polyline at the jump is better than either connecting it (a fake path) or
-    dropping the whole track (losing a real one). Consecutive duplicate points are
-    collapsed so a stopped vehicle does not accumulate thousands of identical
-    vertices.
-    """
-    if len(hist) < 2:
-        return []
-    pts = hist[:, 1:3].astype(np.float64)
-    runs: list[list[np.ndarray]] = [[pts[0]]]
-    for k in range(1, len(pts)):
-        d = float(np.hypot(*(pts[k] - pts[k - 1])))
-        if d > max_jump_px:
-            runs.append([pts[k]])            # break: start a new polyline
-        elif d >= 0.75:                      # drop duplicate / sub-pixel repeats
-            runs[-1].append(pts[k])
-    return [np.array(r, np.int32) for r in runs if len(r) > 1]
+    cv2.rectangle(img, (x, y - h - pad * 2), (x + w + pad * 2, y + base - 1), colour, -1)
+    cv2.putText(img, text, (x + pad, y - pad), FONT, scale, (18, 18, 18), thick, cv2.LINE_AA)
 
 
 def _alpha_rect(img, p1, p2, colour, alpha=0.55):
@@ -100,47 +61,12 @@ def render_annotated_video(
     trail_len: int = 45,
     max_frames: int | None = None,
     road_mask: np.ndarray | None = None,
-    use_contact_anchor: bool = False,
-    draw_contacts: bool = False,
-    dim_off_road: bool = False,
-    min_confirm_frames: int = 0,
-    max_jump_px: float | None = None,
-    show_events: bool = True,
-    compact_labels: bool = False,
 ) -> dict:
     """
     Draw boxes, IDs, classes, speeds, trails, anomaly markers and a live HUD.
 
     `boxes` must carry (frame, track_id, x1, y1, x2, y2); `obs` carries the
     trajectory rows used for trails, speeds and event association.
-
-    `use_contact_anchor` draws trails from the MobileSAM contact point rather than
-    the box bottom-centre, so what is drawn is the path the analytics actually
-    measured. `draw_contacts` additionally overlays the tyre-contact line and a
-    connector from the box point to it - the visible proof of the correction,
-    drawn from the persisted numbers rather than by re-running segmentation.
-
-    Presentation controls, all defaulting to the CLEAN reading of the scene:
-
-    `dim_off_road` darkens everything outside `road_mask` to 42%. It is off by
-    default because it is what produced the "giant white blob" - the road mask is
-    built by dilating trajectory corridors (`road_mask.travelled_mask`), so against
-    a dimmed surround it reads as a fat merged trajectory smear rather than as the
-    road-area estimate it is. The mask is still computed, measured and saved to
-    `road_mask.png`; it just no longer repaints the video.
-
-    `min_confirm_frames` hides tracks whose total observed length is below it, so a
-    one- or two-frame false positive never reaches the screen or the HUD count.
-    Applied at RENDER time only - the analytics keep every observation, so this
-    changes presentation, never the measurements.
-
-    `max_jump_px` breaks a trail where consecutive positions are further apart than
-    this, instead of drawing a line across the frame. Defaults to 4% of the frame
-    diagonal, which at 1920x1080 is ~88 px, or ~2.9 m at this altitude - about
-    320 km/h between frames, so it only ever catches an ID swap, never real motion.
-
-    `show_events` draws the anomaly/conflict overlays. `compact_labels` uses the
-    two-line "#42 - car / 32 km/h" form instead of one run-together line.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -167,31 +93,10 @@ def render_annotated_video(
             (m > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
     # Trails come from the smoothed pixel path of each track.
-    has_seg = "x_seg" in obs.columns and obs["x_seg"].notna().any()
-    anchor = ("x", "y")
-    if use_contact_anchor and has_seg:
-        obs = obs.copy()
-        obs["_ax"] = obs["x_seg"].where(obs["x_seg"].notna(), obs["x"])
-        obs["_ay"] = obs["y_seg"].where(obs["y_seg"].notna(), obs["y"])
-        anchor = ("_ax", "_ay")
-
     trail_by_track: dict[int, np.ndarray] = {}
     obs_sorted = obs.sort_values(["track_id", "frame"])
     for tid, g in obs_sorted.groupby("track_id"):
-        trail_by_track[int(tid)] = g[["frame", *anchor]].to_numpy()
-
-    # (x_seg, y_seg, contact-line left, right, source) per observation.
-    contact_at: dict[tuple[int, int], tuple[float, float, float, float, str]] = {}
-    if has_seg and (draw_contacts or use_contact_anchor):
-        cc = obs.dropna(subset=["x_seg", "y_seg"])
-        lx = cc["seg_l_x"] if "seg_l_x" in cc.columns else cc["x_seg"]
-        rx = cc["seg_r_x"] if "seg_r_x" in cc.columns else cc["x_seg"]
-        src = cc["contact_source"] if "contact_source" in cc.columns else pd.Series("mask", index=cc.index)
-        for f, tid, xs, ys, a, b, s in zip(
-            cc["frame"], cc["track_id"], cc["x_seg"], cc["y_seg"],
-            lx.fillna(cc["x_seg"]), rx.fillna(cc["x_seg"]), src.fillna("mask"),
-        ):
-            contact_at[(int(f), int(tid))] = (float(xs), float(ys), float(a), float(b), str(s))
+        trail_by_track[int(tid)] = g[["frame", "x", "y"]].to_numpy()
 
     speed_lookup: dict[tuple[int, int], float] = {}
     scol = "speed_kph" if calibrated else "speed_px_s"
@@ -238,18 +143,23 @@ def render_annotated_video(
             # goes where the traffic is. Non-destructive: pixels are dimmed, never
             # blanked, so a judge can still see what was excluded and why.
             if off_road is not None:
-                img[off_road] = (img[off_road] * 0.42).astype(np.uint8)
-                cv2.drawContours(img, road_contour, -1, (20, 40, 20), 3, cv2.LINE_AA)
-                cv2.drawContours(img, road_contour, -1, (80, 230, 120), 1, cv2.LINE_AA)
+                img[off_road] = (img[off_road] * 0.38).astype(np.uint8)
+                cv2.drawContours(img, road_contour, -1, (70, 200, 110), 1, cv2.LINE_AA)
 
             active_flags: dict[int, tuple[str, str]] = {}
             conflict_pairs: list[tuple[int, int, str]] = []
             for t0, t1, a, b, et, sev in flagged:
                 if t0 - 0.4 <= t_now <= t1 + 0.4:
-                    if a >= 0:
-                        active_flags[a] = (et, sev)
-                    if b >= 0:
-                        active_flags[b] = (et, sev)
+                    # Higher severity wins when a track is flagged twice at once,
+                    # so a genuine conflict is never hidden behind a low-priority
+                    # label. Without this the frame filled with the least
+                    # interesting event type.
+                    for tid in (a, b):
+                        if tid < 0:
+                            continue
+                        cur = active_flags.get(tid)
+                        if cur is None or SEV_RANK.get(sev, 0) > SEV_RANK.get(cur[1], 0):
+                            active_flags[tid] = (et, sev)
                     if a >= 0 and b >= 0:
                         conflict_pairs.append((a, b, sev))
                     total_events_seen.add(f"{et}:{a}:{b}:{t0}")
@@ -264,17 +174,15 @@ def render_annotated_video(
                     colour = CLASS_COLORS.get(cls, (200, 200, 200))
                     x1, y1, x2, y2 = int(row.x1), int(row.y1), int(row.x2), int(row.y2)
                     cx, cy = (x1 + x2) // 2, y2
-                    # Conflict lines are drawn between the anchors the analytics
-                    # used, so the picture cannot disagree with the numbers.
-                    cpt = contact_at.get((frame_idx, tid))
-                    xi = yi = None
-                    if cpt is not None:
-                        xi, yi = int(round(cpt[0])), int(round(cpt[1]))
-                    centres[tid] = (xi, yi) if (use_contact_anchor and cpt is not None) else (cx, cy)
+                    centres[tid] = (cx, cy)
 
                     flag = active_flags.get(tid)
-                    is_warn = flag is not None
-                    box_colour = WARN if (is_warn and flag[1] == "high") else (WARN_SOFT if is_warn else colour)
+                    sev_now = flag[1] if flag else None
+                    # Low-severity events keep the CLASS colour. Otherwise nearly
+                    # every box turned warning-orange and the class information -
+                    # which is what Level 1 is actually scored on - was lost.
+                    is_warn = sev_now in ("high", "medium")
+                    box_colour = WARN if sev_now == "high" else (WARN_SOFT if is_warn else colour)
                     thickness = 3 if is_warn else 2
 
                     # Trajectory trail. Two layers so the path is continuous from
@@ -304,21 +212,6 @@ def render_annotated_video(
                     cv2.circle(img, (cx, cy), 3, box_colour, -1, cv2.LINE_AA)
                     cv2.rectangle(img, (x1, y1), (x2, y2), box_colour, thickness)
 
-                    # The correction, drawn: box bottom-centre -> mask tyre line.
-                    if draw_contacts and cpt is not None:
-                        lxp, rxp, src = cpt[2], cpt[3], cpt[4]
-                        if abs(xi - cx) + abs(yi - cy) >= 2:
-                            cv2.line(img, (cx, cy), (xi, yi), (235, 235, 235), 1, cv2.LINE_AA)
-                        cv2.line(img, (int(round(lxp)), yi), (int(round(rxp)), yi),
-                                 CONTACT, 2, cv2.LINE_AA)
-                        # Interpolated frames get a hollow marker, so a viewer can
-                        # see which contact points MobileSAM actually produced.
-                        cv2.drawMarker(
-                            img, (xi, yi), CONTACT,
-                            cv2.MARKER_CROSS if src == "mask" else cv2.MARKER_TILTED_CROSS,
-                            9, 1, cv2.LINE_AA,
-                        )
-
                     sp = speed_lookup.get((frame_idx, tid))
                     if sp is not None:
                         sp_txt = f" {sp:.0f}km/h" if calibrated else f" {sp:.0f}px/s"
@@ -327,11 +220,21 @@ def render_annotated_video(
                     _label(img, f"{cls} #{tid}{sp_txt}", (x1, max(y1 - 4, 14)), box_colour)
 
                     if is_warn:
-                        _label(img, flag[0].replace("_", " ").upper(), (x1, min(y2 + 18, H - 4)), WARN, scale=0.42)
+                        # Low-severity events are real output but there are hundreds
+                        # of them; drawing text for every one buried the frame and
+                        # made the whole scene look anomalous. They are all in
+                        # events.csv and the dashboard.
+                        _label(img, flag[0].replace("_", " ").upper(),
+                               (x1, min(y2 + 18, H - 4)), WARN, scale=0.42)
 
             # Conflict pairs: draw the interaction explicitly - this is the thing
-            # fixed-camera systems cannot show.
+            # fixed-camera systems cannot show. Only graded conflicts (medium/high)
+            # get the line and label; the ~150 low-severity close interactions are
+            # a density signal, not safety events, and drawing them all turned the
+            # frame into a web of red lines.
             for a, b, sev in conflict_pairs:
+                if sev not in ("high", "medium"):
+                    continue
                 if a in centres and b in centres:
                     col = WARN if sev == "high" else WARN_SOFT
                     cv2.line(img, centres[a], centres[b], col, 2, cv2.LINE_AA)
@@ -346,12 +249,7 @@ def render_annotated_video(
         cap.release()
         writer.release()
 
-    return {
-        "frames_written": written,
-        "output": out_path,
-        "trail_anchor": "mask_contact_point" if anchor[0] != "x" else "box_bottom_centre",
-        "contact_overlay": bool(draw_contacts and contact_at),
-    }
+    return {"frames_written": written, "output": out_path}
 
 
 def _draw_hud(img, t, active, counts, congestion, calibrated, n_events):
@@ -407,12 +305,6 @@ def render_trajectory_map(obs: pd.DataFrame, summary: pd.DataFrame, calibrated: 
     if obs.empty:
         return None
     xcol, ycol = ("sx", "sy") if calibrated else ("x", "y")
-    if not calibrated and "x_seg" in obs.columns and obs["x_seg"].notna().any():
-        # Uncalibrated map: plot the anchor the kinematics used, not the box point.
-        obs = obs.copy()
-        obs["_ax"] = obs["x_seg"].where(obs["x_seg"].notna(), obs["x"])
-        obs["_ay"] = obs["y_seg"].where(obs["y_seg"].notna(), obs["y"])
-        xcol, ycol = "_ax", "_ay"
     d = obs.dropna(subset=[xcol, ycol])
     if d.empty:
         return None
