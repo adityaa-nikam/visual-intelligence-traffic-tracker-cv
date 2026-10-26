@@ -33,6 +33,8 @@ from pipeline import interpret as interp
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AERIAL_CHECKPOINT = os.path.join(BASE_DIR, "models", "best.pt")
+DEMO_DIR = os.path.join(BASE_DIR, "demo")
+DEMO_TAG = "demo_v4"
 
 
 def _session_isolation_enabled() -> bool:
@@ -96,10 +98,15 @@ def available_tags() -> list[str]:
     for p in glob.glob(os.path.join(OUT_DIR, "summary*.json")):
         base = os.path.basename(p)[len("summary"):-len(".json")]
         found.append((os.path.getmtime(p), base.lstrip("_")))
-    return [t for _, t in sorted(found, reverse=True)]
+    # Ship the original analysis with the app; outputs/ is intentionally ignored
+    # by Git, so hosted deployments otherwise start with an empty run list.
+    output_tags = [t for _, t in sorted(found, reverse=True)]
+    return [DEMO_TAG] + [t for t in output_tags if t != DEMO_TAG]
 
 
 def suffixed(name: str, ext: str, tag: str) -> str:
+    if tag == DEMO_TAG:
+        return os.path.join(DEMO_DIR, f"{name}_demo_v4{ext}")
     return os.path.join(OUT_DIR, f"{name}{'_' + tag if tag else ''}{ext}")
 
 
@@ -219,7 +226,10 @@ def transcode_for_browser(source: str) -> tuple[str | None, str | None]:
 @st.cache_data(show_spinner=False)
 def load_csv(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
-        return pd.DataFrame()
+        # Keep the bundled demo compact in Git; pandas detects gzip from suffix.
+        path = path + ".gz"
+        if not os.path.exists(path):
+            return pd.DataFrame()
     try:
         return pd.read_csv(path)
     except Exception:
@@ -240,7 +250,10 @@ st.caption("Upload an aerial traffic video to detect, track, and analyze road us
 
 model_ready, model_setup_detail = ensure_aerial_model()
 if not model_ready:
-    st.error("The aerial detector could not be installed, so video analysis is unavailable.")
+    st.warning(
+        "New video processing is unavailable because the aerial detector could not be installed. "
+        "The built-in demo analysis and any saved results are still available below."
+    )
     if model_setup_detail:
         with st.expander("Model setup details"):
             st.code(model_setup_detail, language="text")
@@ -414,7 +427,8 @@ with st.sidebar:
     default_tag = st.session_state.pop("selected_run_tag", tags[0])
     selected_index = tags.index(default_tag) if default_tag in tags else 0
     tag = st.selectbox("pipeline output", tags, index=selected_index,
-                       format_func=lambda t: t or "(default)")
+                       format_func=lambda t: "Built-in demo · original video" if t == DEMO_TAG
+                       else t or "(default)")
 
 summary = load_json(suffixed("summary", ".json", tag))
 obs = load_csv(suffixed("trajectories", ".csv", tag))
@@ -538,6 +552,12 @@ if run_meta:
                f"{run_meta.get('effective_config_sha256', run_meta.get('config_sha256', 'unavailable'))[:12]}`")
 elif tag:
     st.caption(f"Saved run `{tag}` · legacy run metadata unavailable")
+if tag == DEMO_TAG:
+    st.info(
+        "This is the preloaded analysis of the project's original demo video. "
+        "It is a historical, exploratory run—not a benchmark or ground-truth result. "
+        "Upload your own clip above to create a new analysis."
+    )
 st.caption(
     "Trajectory-first traffic analytics - every insight below is derived from tracked "
     "road-user trajectories, not from isolated frame detections."

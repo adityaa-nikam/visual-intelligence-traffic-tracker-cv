@@ -3,6 +3,9 @@ data/
 *.mp4
 *.MP4
 *.srt
+# The original demo's browser-ready render is intentionally shipped with the app.
+!demo/
+!demo/*.mp4
 
 # Model weights (downloaded on demand by ultralytics)
 models/

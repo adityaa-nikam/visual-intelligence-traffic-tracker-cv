@@ -11,5 +11,7 @@ models
 *.mp4
 *.MP4
 *.srt
+!demo/
+!demo/*.mp4
 traffic_ai_code.zip
 traffic_ai_outputs.zip

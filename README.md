@@ -120,7 +120,7 @@ python -m unittest discover -s tests -v
 
 ## Deploy on Streamlit Community Cloud
 
-1. Push the project to a GitHub repository. Keep uploaded footage, telemetry, model weights, and generated outputs out of Git; `.gitignore` excludes these local files.
+1. Push the project to a GitHub repository. Uploaded footage, telemetry, model weights, and generated user runs stay out of Git; the compact, precomputed artifacts for the original demo are included under `demo/` so the dashboard has results to show on first launch.
 2. At [share.streamlit.io](https://share.streamlit.io), create an app from the repository, select the branch, and set the entrypoint to `app.py`.
 3. In the deployment's **Advanced settings → Secrets**, add:
 
@@ -128,7 +128,7 @@ python -m unittest discover -s tests -v
    ISOLATE_SESSION_OUTPUTS = "true"
    ```
 
-4. Deploy and wait for the initial model download. Test using a short clip under the configured 100 MB upload limit.
+4. Deploy and wait for the initial model download. The built-in demo analysis is available immediately; test uploads using a short clip under the configured 100 MB upload limit.
 
 The app keeps each visitor's run list in a separate temporary session directory when this setting is enabled. Uploaded media and results may be removed when the host restarts, so do not upload private footage. Community Cloud resources are limited; longer video jobs can be slow or run out of memory. Use this deployment as a learning demo, not a production service.
 

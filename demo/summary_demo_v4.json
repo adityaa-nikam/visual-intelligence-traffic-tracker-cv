@@ -1,0 +1,334 @@
+{
+  "video": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 29.97002997002997,
+    "frames": 1798,
+    "path": "data/intersection.mp4",
+    "stride": 1,
+    "frames_processed": 1798,
+    "processing_fps": 0.34
+  },
+  "detector": {
+    "weights": "models/yolov8s.pt",
+    "imgsz": 1920,
+    "conf": 0.15,
+    "iou": 0.6,
+    "classes": [
+      0,
+      1,
+      2,
+      3,
+      5,
+      7
+    ],
+    "device": "cpu",
+    "strict_conf": 0.25,
+    "class_conf": {
+      "car": 0.25,
+      "bus": 0.25,
+      "truck": 0.25,
+      "motorcycle": 0.15,
+      "bicycle": 0.15,
+      "pedestrian": 0.15
+    },
+    "half": false
+  },
+  "tracker": {
+    "type": "bytetrack",
+    "config": "config/bytetrack.yaml"
+  },
+  "calibration": {
+    "source": "dji_srt",
+    "reason": "",
+    "records": 6824,
+    "gps": [
+      18.566225,
+      73.771845
+    ],
+    "hover_stability": {
+      "rel_alt_p5_p95_spread": 0.022999999999996135,
+      "yaw_deg_p5_p95_spread": 0.4000000000000057,
+      "pitch_deg_p5_p95_spread": 0.0,
+      "roll_deg_p5_p95_spread": 0.0
+    },
+    "usable": true,
+    "altitude_m": 70.47,
+    "focal_px": 1280.0,
+    "gimbal_pitch_deg": -63.1,
+    "gimbal_yaw_deg": -126.6,
+    "metres_per_px_at_centre": 0.0617,
+    "bottom_edge_ground_width_m": 97.6
+  },
+  "road_segmentation": {
+    "enabled": true,
+    "static_scene_justification": "drone hovers (altitude spread 0.023 m, pitch 0.0 deg, yaw 0.4 deg over 6824 telemetry records), so one mask serves every frame",
+    "travelled_area_frac": 0.3153,
+    "sam": "MobileSAM, 48 bare-road prompts, 33 raw segments",
+    "agreement": {
+      "iou": 0.445,
+      "sam_covers_travelled_frac": 0.466,
+      "sam_area_frac": 0.1619
+    },
+    "source": "sam_union_travelled",
+    "seeds": {
+      "count": 48,
+      "excluded_occupied_pixels": true,
+      "note": "prompts placed on bare carriageway, not on vehicles - see road_mask._seed_points"
+    },
+    "segment_vetting": {
+      "accepted": 19,
+      "rejected": 14,
+      "min_overlap_with_travelled": 0.45
+    },
+    "road_area_frac": 0.3301,
+    "overlay": "outputs\\road_mask_v4.png",
+    "road_area_m2": 2592.5,
+    "filter": {
+      "applied": true,
+      "mode": "per-track (a track is kept or dropped as a whole)",
+      "min_on_road_fraction": 0.5,
+      "tracks_before": 546,
+      "tracks_dropped": 54,
+      "observations_dropped": 7474,
+      "dropped_by_class": {
+        "car": 4408,
+        "lgv": 2321,
+        "hgv": 725,
+        "bus": 10,
+        "motorcycle": 10
+      },
+      "exempt_classes": [
+        "pedestrian"
+      ],
+      "note": "tracks spending under half their life on the carriageway are treated as off-road false positives (courtyards, rooftops, vegetation); pedestrians exempt"
+    }
+  },
+  "counts": {
+    "total": 492,
+    "by_class": {
+      "car": 228,
+      "lgv": 53,
+      "hgv": 15,
+      "bus": 12,
+      "motorcycle": 55,
+      "pedestrian": 129
+    },
+    "motor_vehicles": 363,
+    "vulnerable": 184
+  },
+  "classification": {
+    "tracks": 546,
+    "resolved_by_class": {
+      "car": 257,
+      "pedestrian": 129,
+      "lgv": 70,
+      "motorcycle": 56,
+      "hgv": 21,
+      "bus": 13
+    },
+    "model_would_have_said": {
+      "car": 304,
+      "pedestrian": 129,
+      "motorcycle": 56,
+      "truck": 44,
+      "bus": 13
+    },
+    "size_overrode_model": 98,
+    "size_overrode_model_pct": 17.9,
+    "override_flow": [
+      "car -> lgv: 44",
+      "truck -> lgv: 26",
+      "truck -> hgv: 11",
+      "car -> hgv: 10",
+      "truck -> car: 7"
+    ],
+    "class_source_counts": {
+      "measured_size": 194,
+      "model_reliable_for_this_class": 185,
+      "measured_size_overrides_model": 63,
+      "model_only_insufficient_geometry": 62,
+      "measured_size_large": 21,
+      "footprint_fallback_insufficient_geometry": 14,
+      "measured_size_large_model_says_bus": 7
+    },
+    "median_measured_dimensions_m": {
+      "bus": {
+        "length": 4.71,
+        "width": 2.11
+      },
+      "car": {
+        "length": 1.73,
+        "width": 1.06
+      },
+      "hgv": {
+        "length": 5.28,
+        "width": 2.2
+      },
+      "lgv": {
+        "length": 3.32,
+        "width": 2.19
+      },
+      "motorcycle": {
+        "length": 1.46,
+        "width": 0.64
+      },
+      "pedestrian": {
+        "length": 1.4,
+        "width": 0.38
+      }
+    },
+    "method": "length/width solved from the axis-aligned box and the image heading, then median per track; thresholds calibrated on the measured distribution for this footage",
+    "caveat": "measured length is biased upwards by vehicle height (the box's far edge is projected onto the road plane), so these are consistent relative sizes rather than catalogue dimensions"
+  },
+  "kinematics": {
+    "road_users": 492,
+    "speed_unit": "km/h",
+    "acceleration_unit": "m/s^2",
+    "by_class": {
+      "bus": {
+        "road_users": 12.0,
+        "mean_journey_speed_kph": 0.56,
+        "mean_moving_speed_kph": NaN,
+        "p85_speed_kph": NaN,
+        "typical_accel_ms2": 0.16,
+        "typical_decel_ms2": -0.16
+      },
+      "car": {
+        "road_users": 228.0,
+        "mean_journey_speed_kph": 10.54,
+        "mean_moving_speed_kph": 16.23,
+        "p85_speed_kph": 19.44,
+        "typical_accel_ms2": 0.93,
+        "typical_decel_ms2": -0.9
+      },
+      "hgv": {
+        "road_users": 15.0,
+        "mean_journey_speed_kph": 8.28,
+        "mean_moving_speed_kph": 14.44,
+        "p85_speed_kph": 16.0,
+        "typical_accel_ms2": 0.61,
+        "typical_decel_ms2": -0.83
+      },
+      "lgv": {
+        "road_users": 53.0,
+        "mean_journey_speed_kph": 6.24,
+        "mean_moving_speed_kph": 13.0,
+        "p85_speed_kph": 17.03,
+        "typical_accel_ms2": 0.43,
+        "typical_decel_ms2": -0.42
+      },
+      "motorcycle": {
+        "road_users": 55.0,
+        "mean_journey_speed_kph": 11.85,
+        "mean_moving_speed_kph": 14.85,
+        "p85_speed_kph": 17.75,
+        "typical_accel_ms2": 1.77,
+        "typical_decel_ms2": -1.4
+      },
+      "pedestrian": {
+        "road_users": 129.0,
+        "mean_journey_speed_kph": 2.05,
+        "mean_moving_speed_kph": 4.87,
+        "p85_speed_kph": 5.66,
+        "typical_accel_ms2": 0.49,
+        "typical_decel_ms2": -0.51
+      }
+    },
+    "fleet_mean_speed_kph": 7.76,
+    "hardest_braking_ms2": -8.28,
+    "hardest_accel_ms2": 8.08,
+    "extremes_computed_over_tracks": 457,
+    "tracks_with_implausible_accel_spike": 35,
+    "physical_accel_limit_ms2": 10.0,
+    "method": "per-observation speed = centred difference of smoothed ground coordinates over a ~0.5 s baseline; acceleration = smoothed derivative of that speed; headline figures are p95/p5 per track, not the raw extremes",
+    "caveat": "estimates from a single hovering camera. The RAW per-track acceleration extremes reach 26.87 m/s^2, which is not physical - a pixel of box jitter differentiates into tens of m/s^2 on a small object. Raw columns are kept in kinematics.csv for audit but are not reported as results."
+  },
+  "id_stability": {
+    "tracks": 492,
+    "observations": 110779,
+    "mean_track_duration_s": 8.94,
+    "max_track_duration_s": 59.96,
+    "tracks_over_10s": 143,
+    "gap_recoveries": 3426,
+    "longest_bridged_gap_s": 3.14
+  },
+  "speed": {
+    "unit": "km/h",
+    "basis": "telemetry-calibrated ground plane; estimate",
+    "mean_moving_speed": 16.5,
+    "median_moving_speed": 16.9,
+    "p85_speed": 23.4,
+    "robust_max_speed_p99_5": 35.6,
+    "max_speed": 63.1,
+    "max_speed_caveat": "raw max is jitter-sensitive; use p85 / p99.5 for reporting"
+  },
+  "congestion": {
+    "levels": {
+      "MEDIUM": 17,
+      "HIGH": 13
+    },
+    "peak_score": 0.645,
+    "method": "weighted blend of slow-fraction, speed deficit vs observed free-flow, and relative density; analytical estimate, not a certified level of service"
+  },
+  "queues": {
+    "detections": 101,
+    "largest_vehicles": 41,
+    "longest": 88.9,
+    "unit": "m"
+  },
+  "turning_movements": {
+    "left": 15,
+    "right": 27,
+    "straight": 108,
+    "u-turn": 1
+  },
+  "stationary_candidates": 69,
+  "interactions": {
+    "pairs": 433,
+    "potential_conflicts": 131,
+    "critical": 59,
+    "serious": 72,
+    "close_interactions": 189,
+    "geometric_candidates_before_grading": 320,
+    "vulnerable_involved": 38,
+    "min_ttc_s": 0.2,
+    "by_type": {
+      "crossing": 40,
+      "following": 21,
+      "head-on": 20,
+      "crossing/vulnerable-road-user": 20,
+      "merging": 12,
+      "following/vulnerable-road-user": 9,
+      "merging/vulnerable-road-user": 7,
+      "head-on/vulnerable-road-user": 2
+    },
+    "by_severity": {
+      "low": 302,
+      "medium": 72,
+      "high": 59
+    },
+    "grading": "graded jointly on TTC and closing speed; a single TTC threshold flags routine dense-traffic proximity as a conflict",
+    "conflicts_per_minute": 131.1,
+    "conflicts_per_100_road_users": 26.6
+  },
+  "events": {
+    "total": 650,
+    "by_type": {
+      "close_interaction": 189,
+      "potential_conflict": 131,
+      "near_miss_proximity": 113,
+      "sudden_stop": 87,
+      "stationary_vehicle_candidate": 69,
+      "parked_vehicle_candidate": 24,
+      "against_dominant_flow": 13,
+      "queue_formation": 12,
+      "unusual_dwell": 12
+    },
+    "by_severity": {
+      "low": 404,
+      "medium": 141,
+      "high": 105
+    }
+  }
+}
